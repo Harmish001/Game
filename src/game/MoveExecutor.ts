@@ -50,6 +50,18 @@ export class MoveExecutor {
     return null;
   }
 
+  /**
+   * Frame gate for Tekken-style visual strikes:
+   * skip pure windup, allow through active + recovery until move ends.
+   * Actual connect still needs limb-vs-body contact in the mesh layer.
+   */
+  public isInVisualDamageWindow(): boolean {
+    if (this.hasHit || !this.move.hitbox) return false;
+    if (this.isFinished()) return false;
+    const windupEnd = Math.max(1, Math.floor(this.move.startup * 0.35));
+    return this.currentFrame >= windupEnd;
+  }
+
   public canCancelInto(nextMoveId: string): boolean {
     if (!this.hasHit) return false;
     if (!this.move.cancelInto) return false;

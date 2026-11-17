@@ -289,13 +289,12 @@ class CricketClashGame {
   }
 
   private checkCombatCollisions(attacker: Fighter, defender: Fighter): void {
-    const hitbox = attacker.getActiveHitbox();
-    if (!hitbox || !attacker.currentMoveExecutor) return;
+    if (!attacker.currentMoveExecutor || attacker.currentMoveExecutor.hasHit) return;
+    if (!attacker.canAttemptVisualStrike()) return;
 
     // --- Proximity gate: reject hits from too far away ---
     const dist = Math.abs(attacker.x - defender.x);
     const maxRange = (attacker.currentMoveExecutor.move.maxRange ?? 1.4) + (attacker.runUpActive ? 0.5 : 0);
-    // Close-range: skip the range gate entirely; AABB overlap check is authoritative
     if (dist >= 0.3 && dist > maxRange) return;
 
     // Reject hits if attacker is facing completely away from defender
@@ -304,54 +303,71 @@ class CricketClashGame {
       : defender.x <= attacker.x + 0.25;
     if (!isFacingDefender) return;
 
-    let hitWorld = this.hitboxSystem.toWorldBox(hitbox, attacker.x, attacker.y, attacker.facingRight);
+    const hurtWorld = this.hitboxSystem.toWorldBox(
+      defender.getHurtbox(),
+      defender.x,
+      defender.y,
+      defender.facingRight
+    );
 
-    // Close-range coverage: ensure attack hitbox volume extends back through the attacker's own core
-    // so point-blank or overlapping fighters (e.g. inside pushbox collision) connect 100% reliably
-    if (dist <= 0.6) {
-      if (attacker.facingRight) {
-        hitWorld.minX = Math.min(hitWorld.minX, attacker.x - 0.25);
-      } else {
-        hitWorld.maxX = Math.max(hitWorld.maxX, attacker.x + 0.25);
+    let connected = false;
+    let impactX = (hurtWorld.minX + hurtWorld.maxX) * 0.5;
+    let impactY = (hurtWorld.minY + hurtWorld.maxY) * 0.5;
+
+    // Tekken-style: fist/foot bone must touch hurtbox during contact anim window
+    if (attacker.mesh?.usesVisualStrikes()) {
+      const radius = attacker.mesh.getStrikeRadius() + (attacker.runUpActive ? 0.08 : 0);
+      const points = attacker.mesh.getStrikePoints2D(attacker.currentMoveExecutor.move.id);
+      for (const p of points) {
+        if (this.hitboxSystem.pointHitsBox(p.x, p.y, radius, hurtWorld)) {
+          connected = true;
+          impactX = p.x;
+          impactY = p.y;
+          break;
+        }
+      }
+    } else {
+      // Stick-figure fallback: classic active-frame AABB
+      const hitbox = attacker.getActiveHitbox();
+      if (!hitbox) return;
+      let hitWorld = this.hitboxSystem.toWorldBox(hitbox, attacker.x, attacker.y, attacker.facingRight);
+      if (dist <= 0.6) {
+        if (attacker.facingRight) hitWorld.minX = Math.min(hitWorld.minX, attacker.x - 0.25);
+        else hitWorld.maxX = Math.max(hitWorld.maxX, attacker.x + 0.25);
+      }
+      connected = this.hitboxSystem.checkOverlap(hitWorld, hurtWorld);
+      if (connected) {
+        impactX = (hitWorld.minX + hurtWorld.minX) * 0.5;
+        impactY = (hitWorld.minY + hurtWorld.minY) * 0.5;
       }
     }
-    const hurtWorld = this.hitboxSystem.toWorldBox(defender.getHurtbox(), defender.x, defender.y, defender.facingRight);
 
-    if (this.hitboxSystem.checkOverlap(hitWorld, hurtWorld)) {
-      // Mark move as having connected
-      attacker.currentMoveExecutor.hasHit = true;
+    if (!connected) return;
 
-      const isThrow = attacker.currentMoveExecutor.move.hitLevel === 'throw';
-      const result = defender.takeHit(attacker, attacker.currentMoveExecutor.move, isThrow);
+    attacker.currentMoveExecutor.hasHit = true;
 
-      // VFX & Audio triggers
-      const impactX = (hitWorld.minX + hurtWorld.minX) * 0.5;
-      const impactY = (hitWorld.minY + hurtWorld.minY) * 0.5;
+    const isThrow = attacker.currentMoveExecutor.move.hitLevel === 'throw';
+    const result = defender.takeHit(attacker, attacker.currentMoveExecutor.move, isThrow);
 
-      if (result.blocked) {
-        this.audioManager.playBlock();
-        this.vfxSystem.spawnHitSparks(impactX, impactY, 'block');
-      } else {
-        // Clean Hit
-        const sfxType = attacker.currentMoveExecutor.move.sfxType;
-        if (sfxType === 'heavy_hit' || sfxType === 'bat_hit') this.audioManager.playHeavyHit();
-        else if (sfxType === 'super') this.audioManager.playSuperFlash();
-        else this.audioManager.playLightHit();
+    if (result.blocked) {
+      this.audioManager.playBlock();
+      this.vfxSystem.spawnHitSparks(impactX, impactY, 'block');
+    } else {
+      const sfxType = attacker.currentMoveExecutor.move.sfxType;
+      if (sfxType === 'heavy_hit' || sfxType === 'bat_hit') this.audioManager.playHeavyHit();
+      else if (sfxType === 'super') this.audioManager.playSuperFlash();
+      else this.audioManager.playLightHit();
 
-        const vfxType = attacker.currentMoveExecutor.move.vfxType;
-        this.vfxSystem.spawnHitSparks(
-          impactX,
-          impactY,
-          vfxType === 'super' ? 'super' : vfxType === 'punch' ? 'heavy' : 'heavy'
-        );
+      const vfxType = attacker.currentMoveExecutor.move.vfxType;
+      this.vfxSystem.spawnHitSparks(
+        impactX,
+        impactY,
+        vfxType === 'super' ? 'super' : 'heavy'
+      );
 
-        // Screen Shake
-        const intensity = vfxType === 'super' ? 0.45 : vfxType === 'sparks' ? 0.25 : 0.12;
-        this.sceneManager.triggerScreenShake(intensity, 0.2);
-
-        // Set Hitstop freeze frames
-        this.vfxSystem.setHitstop(result.hitstop);
-      }
+      const intensity = vfxType === 'super' ? 0.45 : vfxType === 'sparks' ? 0.25 : 0.12;
+      this.sceneManager.triggerScreenShake(intensity, 0.2);
+      this.vfxSystem.setHitstop(result.hitstop);
     }
   }
 
@@ -380,7 +396,7 @@ class CricketClashGame {
       type: 'hurt'
     });
 
-    // Hitboxes
+    // Legacy AABB hitboxes (stick path) — still useful as reference
     const p1Hit = this.p1.getActiveHitbox();
     if (p1Hit) {
       boxes.push({
@@ -388,7 +404,6 @@ class CricketClashGame {
         type: 'hit'
       });
     }
-
     const p2Hit = this.p2.getActiveHitbox();
     if (p2Hit) {
       boxes.push({
@@ -398,6 +413,18 @@ class CricketClashGame {
     }
 
     this.hitboxSystem.updateDebugBoxes(boxes);
+
+    // Tekken strike sensors (fist/foot) — magenta; bright when in contact window
+    for (const f of [this.p1, this.p2]) {
+      if (!f.mesh?.usesVisualStrikes() || f.state !== 'ATTACK' || !f.currentMoveExecutor) continue;
+      const moveId = f.currentMoveExecutor.move.id;
+      const hot = f.canAttemptVisualStrike();
+      this.hitboxSystem.addDebugStrikePoints(
+        f.mesh.getStrikePoints2D(moveId),
+        f.mesh.getStrikeRadius(),
+        hot
+      );
+    }
   }
 
   // --- RENDER ---

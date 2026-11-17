@@ -77,6 +77,9 @@ export class Fighter {
   // Parry / Just-Defend
   public parryTimer: number = 0; // Active parry window (5 frames)
   public blockLockTimer: number = 0; // Whiffed parry penalty (12 frames)
+
+  /** Bumps when hit/block/knockdown applied — mesh restarts react clip */
+  public animReactNonce: number = 0;
   private prevInputBlock: boolean = false;
 
   // Bounds
@@ -203,6 +206,11 @@ export class Fighter {
       this.mesh.root.position.set(this.x, this.y, 0);
       const moveProgress = this.currentMoveExecutor ? this.currentMoveExecutor.getProgress() : 0;
       const activeMoveId = this.currentMoveExecutor ? this.currentMoveExecutor.move.id : '';
+      // Seconds so mesh can stretch punch/kick/hit-react across real frame data
+      const moveDurationSec = this.currentMoveExecutor
+        ? this.currentMoveExecutor.totalFrames / 60
+        : 0;
+      const stateDurationSec = this.stateFramesTarget > 0 ? this.stateFramesTarget / 60 : 0;
       this.mesh.updateAnimation(
         this.state,
         this.stateTimer,
@@ -210,7 +218,10 @@ export class Fighter {
         moveProgress,
         activeMoveId,
         dt,
-        this.y
+        this.y,
+        moveDurationSec,
+        stateDurationSec,
+        this.animReactNonce
       );
     }
   }
@@ -812,6 +823,16 @@ export class Fighter {
     return null;
   }
 
+  /** Frame + anim window open for a possible visual strike connect */
+  public canAttemptVisualStrike(): boolean {
+    if (this.state !== 'ATTACK' || !this.currentMoveExecutor) return false;
+    if (!this.currentMoveExecutor.isInVisualDamageWindow()) return false;
+    if (!this.mesh?.usesVisualStrikes()) {
+      return this.currentMoveExecutor.isActive();
+    }
+    return this.mesh.isInStrikeContactWindow(this.currentMoveExecutor.move.id);
+  }
+
   // --- DAMAGE & BLOCKING ---
 
   public takeHit(
@@ -934,6 +955,7 @@ export class Fighter {
       if (this.guardGauge <= 0) {
         this.guardGauge = 50;
         this.stateFramesTarget = 40;
+        this.animReactNonce++;
         this.changeState('GUARD_CRUSH');
         const dir = this.facingRight ? -1 : 1;
         this.vx = dir * 2.5;
@@ -953,6 +975,7 @@ export class Fighter {
       finalDamage = move.chipDamage || 0;
       this.health = Math.max(1, this.health - finalDamage); // Chip cannot kill in v1
       this.stateFramesTarget = Math.max(6, 12 - move.onBlockFrameAdvantage);
+      this.animReactNonce++;
       this.changeState('BLOCK_STUN');
 
       const dir = this.facingRight ? -1 : 1;
@@ -1049,20 +1072,24 @@ export class Fighter {
         this.juggleCount++;
         if (this.juggleCount >= 3) {
           // Juggle limit reached: force hard knockdown
+          this.animReactNonce++;
           this.changeState('KNOCKDOWN');
           this.vy = -1.0;
         } else {
+          this.animReactNonce++;
           this.changeState('JUMPING');
           this.vy = Math.max(2.5, kbY);
         }
       } else if (move.isLauncher) {
         this.juggleCount = 0;
         this.vy = Math.max(4.5, kbY * 1.5);
+        this.animReactNonce++;
         this.changeState('JUMPING');
       } else if (move.isHardKnockdown || this.health <= 0) {
         if (this.y <= 0) {
           this.vy = Math.max(0.6, kbY);
         }
+        this.animReactNonce++;
         this.changeState('KNOCKDOWN');
       } else {
         const chaseBonus = attacker.chaseModeTimer > 0 ? 1 : 0;
@@ -1070,6 +1097,7 @@ export class Fighter {
           10,
           14 + move.onHitFrameAdvantage + chaseBonus + (isCounter ? 4 : 0)
         );
+        this.animReactNonce++;
         this.changeState('HIT_STUN');
       }
     }
@@ -1116,6 +1144,7 @@ export class Fighter {
     this.currentMoveExecutor = null;
     this.bufferedAttack = null;
     this.changeState('IDLE');
+    this.mesh?.playIntro();
   }
 
   public toSimState(): FighterSimState {
