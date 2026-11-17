@@ -33,9 +33,9 @@ export class MatchManager {
     p2MaxCombo: 0
   };
 
-  private audio: AudioManager;
-  private sceneManager: SceneManager;
-  private vfx: VFXSystem;
+  private audio?: AudioManager;
+  private sceneManager?: SceneManager;
+  private vfx?: VFXSystem;
 
   // Callbacks to UI
   public onPhaseChange?: (phase: MatchPhase, bannerText: string) => void;
@@ -43,9 +43,9 @@ export class MatchManager {
 
   constructor(
     settings: MatchSettings,
-    audio: AudioManager,
-    sceneManager: SceneManager,
-    vfx: VFXSystem
+    audio?: AudioManager,
+    sceneManager?: SceneManager,
+    vfx?: VFXSystem
   ) {
     this.settings = settings;
     this.audio = audio;
@@ -80,9 +80,9 @@ export class MatchManager {
 
     // Announce Round
     const roundText = this.currentRound === 3 ? 'FINAL ROUND' : `ROUND ${this.currentRound}`;
-    if (this.currentRound === 1) this.audio.playAnnouncer('round1');
-    else if (this.currentRound === 2) this.audio.playAnnouncer('round2');
-    else this.audio.playAnnouncer('finalround');
+    if (this.currentRound === 1) this.audio?.playAnnouncer('round1');
+    else if (this.currentRound === 2) this.audio?.playAnnouncer('round2');
+    else this.audio?.playAnnouncer('finalround');
 
     if (this.onPhaseChange) {
       this.onPhaseChange(this.phase, roundText);
@@ -100,7 +100,7 @@ export class MatchManager {
       case 'ROUND_INTRO': {
         // After 1.5 seconds, announce "FIGHT!" and enable control
         if (this.phaseTimer >= 1.5 && this.phaseTimer - dt < 1.5) {
-          this.audio.playAnnouncer('fight');
+          this.audio?.playAnnouncer('fight');
           if (this.onPhaseChange) {
             this.onPhaseChange(this.phase, 'FIGHT!');
           }
@@ -108,7 +108,7 @@ export class MatchManager {
         if (this.phaseTimer >= 2.2) {
           this.phase = 'FIGHTING';
           this.phaseTimer = 0;
-          this.audio.startBattleMusic();
+          this.audio?.startBattleMusic();
           if (this.onPhaseChange) {
             this.onPhaseChange(this.phase, '');
           }
@@ -166,29 +166,29 @@ export class MatchManager {
     this.stats.roundsPlayed++;
 
     if (reason === 'KO') {
-      this.audio.playKO();
-      this.sceneManager.triggerScreenShake(0.5, 0.4);
+      this.audio?.playKO();
+      this.sceneManager?.triggerScreenShake(0.5, 0.4);
     }
 
     let winnerText = '';
     if (p1.health <= 0 && p2.health <= 0) {
       winnerText = 'DOUBLE K.O. — DRAW';
-      this.audio.playAnnouncer('draw');
+      this.audio?.playAnnouncer('draw');
     } else if (p2.health <= 0 || (reason === 'TIME_UP' && p1.health > p2.health)) {
       this.p1RoundsWon++;
       p1.changeState('WIN');
       p2.changeState('LOSE');
       winnerText = reason === 'KO' ? 'K.O.! PLAYER 1 WINS' : 'TIME UP! PLAYER 1 WINS';
-      this.audio.playAnnouncer('p1wins');
+      this.audio?.playAnnouncer('p1wins');
     } else if (p1.health <= 0 || (reason === 'TIME_UP' && p2.health > p1.health)) {
       this.p2RoundsWon++;
       p2.changeState('WIN');
       p1.changeState('LOSE');
       winnerText = reason === 'KO' ? 'K.O.! PLAYER 2 WINS' : 'TIME UP! PLAYER 2 WINS';
-      this.audio.playAnnouncer('p2wins');
+      this.audio?.playAnnouncer('p2wins');
     } else {
       winnerText = 'DRAW';
-      this.audio.playAnnouncer('draw');
+      this.audio?.playAnnouncer('draw');
     }
 
     if (this.onPhaseChange) {
@@ -200,7 +200,7 @@ export class MatchManager {
     this.phase = 'MATCH_OVER';
     this.phaseTimer = 0;
     this.stats.winner = winner;
-    this.audio.stopBattleMusic();
+    this.audio?.stopBattleMusic();
 
     if (this.onMatchComplete) {
       this.onMatchComplete(this.stats);

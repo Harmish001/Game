@@ -21,6 +21,7 @@ export class FighterMesh {
   private rightArm: THREE.Group = new THREE.Group(); // Rear / power arm (further from opponent)
   private leftLeg: THREE.Group = new THREE.Group();  // Lead / front leg (closer to opponent)
   private rightLeg: THREE.Group = new THREE.Group(); // Rear / power leg (further from opponent)
+  private shadowBlob: THREE.Mesh | null = null;
 
   // Mesh materials
   private jerseyMat: THREE.MeshStandardMaterial;
@@ -70,6 +71,19 @@ export class FighterMesh {
   private buildRig(): void {
     this.root.castShadow = true;
     this.root.receiveShadow = true;
+
+    // --- Ground Shadow Blob ---
+    const shadowGeo = new THREE.CircleGeometry(0.42, 16);
+    shadowGeo.rotateX(-Math.PI / 2);
+    const shadowMat = new THREE.MeshBasicMaterial({
+      color: 0x030712,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false
+    });
+    this.shadowBlob = new THREE.Mesh(shadowGeo, shadowMat);
+    this.shadowBlob.position.set(0, 0.012, 0);
+    this.root.add(this.shadowBlob);
 
     // --- Hips / Pelvis ---
     const hipsGeo = new THREE.BoxGeometry(0.38, 0.22, 0.26);
@@ -221,13 +235,23 @@ export class FighterMesh {
     facingRight: boolean,
     moveProgress: number = 0,
     activeMoveId: string = '',
-    dt: number = 0.016
+    dt: number = 0.016,
+    fighterY: number = 0
   ): void {
     this.animTimer += dt;
     const t = this.animTimer;
 
     // Face the correct direction
-    this.root.rotation.y = facingRight ? Math.PI / 2 : -Math.PI / 2;
+    this.root.rotation.set(0, facingRight ? Math.PI / 2 : -Math.PI / 2, 0);
+
+    // Update Ground Shadow Blob
+    if (this.shadowBlob) {
+      const clampedY = Math.max(0, fighterY);
+      const scale = Math.max(0.35, 1.0 - clampedY * 0.16);
+      this.shadowBlob.scale.set(scale, scale, scale);
+      this.shadowBlob.position.set(0, -clampedY + 0.012, 0);
+      (this.shadowBlob.material as THREE.MeshBasicMaterial).opacity = Math.max(0.12, 0.55 - clampedY * 0.12);
+    }
 
     // Reset default transforms
     this.hips.position.y = 0.95;
@@ -367,17 +391,24 @@ export class FighterMesh {
       }
 
       case 'KNOCKDOWN': {
-        // Lying flat on ground
-        this.root.rotation.x = -Math.PI / 2;
-        this.hips.position.y = 0.18;
+        // Lying flat on the mat along the X fighting axis, head pointing away from opponent
+        this.hips.position.y = 0.20;
+        this.hips.rotation.x = -Math.PI / 2;
+        this.torso.rotation.x = -0.05;
+        this.leftLeg.rotation.x = -0.15;
+        this.rightLeg.rotation.x = 0.15;
+        this.leftArm.rotation.x = 0.2;
+        this.rightArm.rotation.x = 0.2;
         break;
       }
 
       case 'GET_UP': {
-        // Rolling back up to stance
-        const p = Math.min(1, stateTimer * 4.0);
-        this.root.rotation.x = (-Math.PI / 2) * (1 - p);
-        this.hips.position.y = 0.18 + p * 0.77;
+        // Rising from the canvas back into combat stance
+        const p = Math.min(1.0, stateTimer * 3.5);
+        this.hips.position.y = 0.20 + p * 0.75;
+        this.hips.rotation.x = (-Math.PI / 2) * (1.0 - p);
+        this.leftArm.rotation.x = -0.8 * p;
+        this.rightArm.rotation.x = -0.7 * p;
         break;
       }
 
@@ -395,6 +426,34 @@ export class FighterMesh {
         break;
       }
 
+      case 'GUARD_CRUSH': {
+        // Stunned backwards, guard broken, completely open
+        const wobble = Math.sin(t * 12.0) * 0.06;
+        this.hips.position.y = 0.88;
+        this.torso.rotation.x = 0.25 + wobble;
+        this.head.rotation.x = 0.35;
+        this.leftArm.rotation.x = 0.3;
+        this.rightArm.rotation.x = 0.3;
+        break;
+      }
+
+      case 'THROW_WHIFF': {
+        // Failed grab forward, off-balance
+        this.torso.rotation.x = -0.35;
+        this.leftArm.rotation.x = -1.2;
+        this.rightArm.rotation.x = -1.2;
+        this.hips.position.y = 0.88;
+        break;
+      }
+
+      case 'THROW_TECH': {
+        // Tech separation push
+        this.torso.rotation.x = 0.15;
+        this.leftArm.rotation.x = -0.8;
+        this.rightArm.rotation.x = -0.8;
+        break;
+      }
+
       case 'WIN': {
         // Dual fist pump victory
         this.hips.position.y = 1.0;
@@ -404,12 +463,13 @@ export class FighterMesh {
       }
 
       case 'LOSE': {
-        // Slumped in defeat
-        this.hips.position.y = 0.78;
-        this.torso.rotation.x = -0.45;
-        this.head.rotation.x = -0.4;
-        this.leftArm.rotation.x = 0.1;
-        this.rightArm.rotation.x = 0.1;
+        // Collapsed on the ground in defeat
+        this.hips.position.y = 0.22;
+        this.hips.rotation.x = -Math.PI / 2 * 0.8;
+        this.torso.rotation.x = -0.3;
+        this.head.rotation.x = -0.3;
+        this.leftArm.rotation.x = 0.2;
+        this.rightArm.rotation.x = 0.2;
         break;
       }
     }
@@ -424,7 +484,14 @@ export class FighterMesh {
   private animateAttack(moveId: string, progress: number): void {
     const p = Math.sin(progress * Math.PI);
 
-    if (moveId.includes('lp') || moveId.includes('jab')) {
+    if (moveId.includes('jump') || moveId.includes('j_')) {
+      // --- Aerial Downward Strike ---
+      this.torso.rotation.x = -p * 0.35;
+      this.leftArm.rotation.x = -0.6 - p * 1.6;
+      this.rightArm.rotation.x = -0.5 - p * 1.5;
+      this.leftLeg.rotation.x = -0.4;
+      this.rightLeg.rotation.x = 0.3;
+    } else if (moveId.includes('lp') || moveId.includes('jab')) {
       // --- Fast Lead Jab (Front Arm) ---
       // Front arm punches straight forward towards opponent!
       this.torso.rotation.x = -p * 0.15; // Lean into punch

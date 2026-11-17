@@ -5,6 +5,7 @@ import { AudioManager } from './engine/AudioManager';
 import { SceneManager } from './engine/SceneManager';
 import { HitboxSystem, WorldBox2D } from './engine/HitboxSystem';
 import { VFXSystem } from './engine/VFXSystem';
+import { ProjectileSystem } from './game/projectiles/ProjectileSystem';
 import { Fighter } from './game/Fighter';
 import { CPUAI } from './game/ai/CPUAI';
 import { MatchManager, MatchStats } from './game/MatchManager';
@@ -24,6 +25,7 @@ class CricketClashGame {
   private inputManager: InputManager;
   private hitboxSystem: HitboxSystem;
   private vfxSystem: VFXSystem;
+  private projectileSystem: ProjectileSystem;
   private loop: GameLoop;
   private cpuAI: CPUAI;
 
@@ -40,6 +42,7 @@ class CricketClashGame {
   // State
   private isMatchRunning: boolean = false;
   private previewFighterGroup: THREE.Group | null = null;
+  private trainingDummyMode: 'stand' | 'always_block' | 'crouch_block' = 'stand';
 
   constructor() {
     this.canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
@@ -51,6 +54,7 @@ class CricketClashGame {
     this.inputManager = new InputManager();
     this.hitboxSystem = new HitboxSystem(this.sceneManager.scene);
     this.vfxSystem = new VFXSystem(this.sceneManager.scene);
+    this.projectileSystem = new ProjectileSystem(this.sceneManager.scene);
     this.cpuAI = new CPUAI('normal');
 
     // 2. Initialize UI Layers
@@ -79,6 +83,13 @@ class CricketClashGame {
       if (e.key === 'h' || e.key === 'H') {
         const visible = this.hitboxSystem.toggleDebug();
         console.log(`Hitbox Debug: ${visible ? 'ON' : 'OFF'}`);
+      }
+      if ((e.key === 'b' || e.key === 'B') && this.isMatchRunning && this.matchManager?.settings.mode === 'training') {
+        const modes: Array<'stand' | 'always_block' | 'crouch_block'> = ['stand', 'always_block', 'crouch_block'];
+        const nextIdx = (modes.indexOf(this.trainingDummyMode) + 1) % modes.length;
+        this.trainingDummyMode = modes[nextIdx];
+        this.hud.showBanner(`DUMMY: ${this.trainingDummyMode.replace('_', ' ').toUpperCase()}`);
+        setTimeout(() => this.hud.showBanner(''), 1200);
       }
       if (e.key === 'Escape' && this.isMatchRunning) {
         this.togglePause();
@@ -144,6 +155,9 @@ class CricketClashGame {
 
     this.p1 = new Fighter(p1Profile, 1, -3.5, this.sceneManager.scene);
     this.p2 = new Fighter(p2Profile, 2, 3.5, this.sceneManager.scene);
+    this.projectileSystem.clear();
+    this.p1.projectileSystem = this.projectileSystem;
+    this.p2.projectileSystem = this.projectileSystem;
 
     // Set CPU AI
     this.cpuAI.setDifficulty(settings.difficulty);
@@ -173,13 +187,14 @@ class CricketClashGame {
   private endCurrentMatch(): void {
     this.isMatchRunning = false;
     this.audioManager.stopBattleMusic();
+    this.projectileSystem.clear();
 
     if (this.p1) {
-      this.sceneManager.scene.remove(this.p1.mesh.root);
+      if (this.p1.mesh) this.sceneManager.scene.remove(this.p1.mesh.root);
       this.p1 = null;
     }
     if (this.p2) {
-      this.sceneManager.scene.remove(this.p2.mesh.root);
+      if (this.p2.mesh) this.sceneManager.scene.remove(this.p2.mesh.root);
       this.p2 = null;
     }
     this.matchManager = null;
@@ -212,12 +227,19 @@ class CricketClashGame {
       p2Input = this.inputManager.getPlayerInput(2, p2Facing);
       p2Motion = this.inputManager.detectMotion(2);
     } else if (this.matchManager.settings.mode === 'training') {
-      // Training dummy stands still
       p2Input = {
         up: false, down: false, left: false, right: false,
         lp: false, hp: false, lk: false, hk: false,
         block: false, special: false, super: false, pause: false
       };
+      if (this.trainingDummyMode === 'always_block') {
+        p2Input.block = true;
+        if (p2Facing) p2Input.left = true; else p2Input.right = true;
+      } else if (this.trainingDummyMode === 'crouch_block') {
+        p2Input.block = true;
+        p2Input.down = true;
+        if (p2Facing) p2Input.left = true; else p2Input.right = true;
+      }
     } else {
       // CPU AI
       p2Input = this.cpuAI.update(this.p2, this.p1, dt);
@@ -240,8 +262,9 @@ class CricketClashGame {
     this.p1.x += pushShift.p1Shift;
     this.p2.x += pushShift.p2Shift;
 
-    // 5. Check Attack Hitboxes vs Hurtboxes
+    // 5. Check Attack Hitboxes vs Hurtboxes & Update Projectiles
     if (this.matchManager.phase === 'FIGHTING') {
+      this.projectileSystem.update(dt, this.p1, this.p2);
       this.checkCombatCollisions(this.p1, this.p2);
       this.checkCombatCollisions(this.p2, this.p1);
     }
@@ -253,11 +276,13 @@ class CricketClashGame {
     this.hud.update(this.p1, this.p2, this.matchManager, dt);
 
     // 8. Update Camera 2.5D tracking
-    this.sceneManager.updateCamera(
-      this.p1.mesh.root.position,
-      this.p2.mesh.root.position,
-      dt
-    );
+    if (this.p1.mesh && this.p2.mesh) {
+      this.sceneManager.updateCamera(
+        this.p1.mesh.root.position,
+        this.p2.mesh.root.position,
+        dt
+      );
+    }
 
     // 9. Update Debug Hitboxes (if toggled)
     this.updateDebugHitboxes();
@@ -269,8 +294,9 @@ class CricketClashGame {
 
     // --- Proximity gate: reject hits from too far away ---
     const dist = Math.abs(attacker.x - defender.x);
-    const maxRange = attacker.currentMoveExecutor.move.maxRange ?? 1.4;
-    if (dist > maxRange) return;
+    const maxRange = (attacker.currentMoveExecutor.move.maxRange ?? 1.4) + (attacker.runUpActive ? 0.5 : 0);
+    // Close-range: skip the range gate entirely; AABB overlap check is authoritative
+    if (dist >= 0.3 && dist > maxRange) return;
 
     // Reject hits if attacker is facing completely away from defender
     const isFacingDefender = attacker.facingRight
@@ -278,7 +304,17 @@ class CricketClashGame {
       : defender.x <= attacker.x + 0.25;
     if (!isFacingDefender) return;
 
-    const hitWorld = this.hitboxSystem.toWorldBox(hitbox, attacker.x, attacker.y, attacker.facingRight);
+    let hitWorld = this.hitboxSystem.toWorldBox(hitbox, attacker.x, attacker.y, attacker.facingRight);
+
+    // Close-range coverage: ensure attack hitbox volume extends back through the attacker's own core
+    // so point-blank or overlapping fighters (e.g. inside pushbox collision) connect 100% reliably
+    if (dist <= 0.6) {
+      if (attacker.facingRight) {
+        hitWorld.minX = Math.min(hitWorld.minX, attacker.x - 0.25);
+      } else {
+        hitWorld.maxX = Math.max(hitWorld.maxX, attacker.x + 0.25);
+      }
+    }
     const hurtWorld = this.hitboxSystem.toWorldBox(defender.getHurtbox(), defender.x, defender.y, defender.facingRight);
 
     if (this.hitboxSystem.checkOverlap(hitWorld, hurtWorld)) {

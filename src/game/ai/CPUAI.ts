@@ -1,19 +1,23 @@
 import { AIDifficulty, RawPlayerInput } from '../types';
 import { Fighter } from '../Fighter';
+import { PRNG } from '../../engine/PRNG';
 
 export class CPUAI {
   private difficulty: AIDifficulty;
-  private reactionTimer: number = 0;
   private actionTimer: number = 0;
   private currentInput: RawPlayerInput = this.createEmptyInput();
+  private rng: PRNG;
 
   // Difficulty parameters
+  // Human visual reaction is ~150-200ms (9-12 frames). Expert reaction floors raised from 3 frames (50ms) to 10 frames (~160ms)
   private reactionDelay: number = 0.25; // seconds
   private blockRate: number = 0.5; // 0 to 1
   private comboSkill: number = 0.5;
+  private executionErrorRate: number = 0.15; // chance to drop or miscue
 
-  constructor(difficulty: AIDifficulty = 'normal') {
+  constructor(difficulty: AIDifficulty = 'normal', rng?: PRNG) {
     this.difficulty = difficulty;
+    this.rng = rng || new PRNG(12345);
     this.setDifficulty(difficulty);
   }
 
@@ -21,26 +25,42 @@ export class CPUAI {
     this.difficulty = difficulty;
     switch (difficulty) {
       case 'easy':
-        this.reactionDelay = 0.5;
-        this.blockRate = 0.2;
-        this.comboSkill = 0.2;
+        this.reactionDelay = 0.50; // ~30 frames
+        this.blockRate = 0.20;
+        this.comboSkill = 0.20;
+        this.executionErrorRate = 0.30;
         break;
       case 'normal':
-        this.reactionDelay = 0.25;
-        this.blockRate = 0.5;
-        this.comboSkill = 0.6;
+        this.reactionDelay = 0.35; // ~21 frames
+        this.blockRate = 0.45;
+        this.comboSkill = 0.55;
+        this.executionErrorRate = 0.15;
         break;
       case 'hard':
-        this.reactionDelay = 0.1;
-        this.blockRate = 0.78;
-        this.comboSkill = 0.85;
+        this.reactionDelay = 0.22; // ~13 frames
+        this.blockRate = 0.70;
+        this.comboSkill = 0.80;
+        this.executionErrorRate = 0.08;
         break;
       case 'expert':
-        this.reactionDelay = 0.05;
-        this.blockRate = 0.92;
-        this.comboSkill = 0.98;
+        this.reactionDelay = 0.16; // ~10 frames (realistic pro reaction, not 3 frames)
+        this.blockRate = 0.85;
+        this.comboSkill = 0.92;
+        this.executionErrorRate = 0.04;
         break;
     }
+  }
+
+  public getDifficulty(): AIDifficulty {
+    return this.difficulty;
+  }
+
+  public getReactionDelay(): number {
+    return this.reactionDelay;
+  }
+
+  public setRng(rng: PRNG): void {
+    this.rng = rng;
   }
 
   private createEmptyInput(): RawPlayerInput {
@@ -61,10 +81,9 @@ export class CPUAI {
   }
 
   public update(self: Fighter, opponent: Fighter, dt: number): RawPlayerInput {
-    this.reactionTimer += dt;
     this.actionTimer += dt;
 
-    // React periodically based on difficulty
+    // React periodically based on difficulty reaction delay
     if (this.actionTimer >= this.reactionDelay) {
       this.actionTimer = 0;
       this.currentInput = this.decideAction(self, opponent);
@@ -74,32 +93,37 @@ export class CPUAI {
   }
 
   private decideAction(self: Fighter, opponent: Fighter): RawPlayerInput {
+    // Execution error check: AI occasionally drops action
+    if (this.rng.chance(this.executionErrorRate)) {
+      return this.createEmptyInput();
+    }
+
     const input = this.createEmptyInput();
     const distance = Math.abs(self.x - opponent.x);
     const opponentIsAttacking = opponent.state === 'ATTACK';
     const opponentIsJumping = opponent.state === 'JUMPING';
-    const isFacingOpponent = (self.x < opponent.x && self.facingRight) || (self.x > opponent.x && !self.facingRight);
 
     // 1. DEFENSE / BLOCKING DECISION
-    if (opponentIsAttacking && Math.random() < this.blockRate && distance < 2.5) {
-      // Hold backward to block
-      if (self.facingRight) {
+    if (opponentIsAttacking && this.rng.chance(this.blockRate) && distance < 2.5) {
+      input.block = true;
+      // Hold backward relative to opponent position
+      if (self.x < opponent.x) {
         input.left = true;
       } else {
         input.right = true;
       }
 
-      // Crouch block if opponent is attacking low or by random choice
-      if (Math.random() < 0.45) {
+      // Crouch block if opponent is attacking low or by probabilistic choice
+      if (this.rng.chance(0.45)) {
         input.down = true;
       }
       return input;
     }
 
     // 2. ANTI-AIR REACTION
-    if (opponentIsJumping && distance < 2.2 && Math.random() < this.comboSkill) {
+    if (opponentIsJumping && distance < 2.2 && this.rng.chance(this.comboSkill)) {
       // Anti-air with Heavy Punch or Special 2
-      if (Math.random() < 0.5) {
+      if (this.rng.chance(0.5)) {
         input.hp = true;
       } else {
         input.special = true;
@@ -107,15 +131,15 @@ export class CPUAI {
       return input;
     }
 
-    // 3. SUPER ATTACK (When available and opponent whiffs or close)
-    if (self.meter >= 100 && distance < 2.8 && Math.random() < this.comboSkill * 0.7) {
+    // 3. SUPER ATTACK (When available and opponent close/recovering)
+    if (self.meter >= 100 && distance < 2.8 && this.rng.chance(this.comboSkill * 0.7)) {
       input.super = true;
       return input;
     }
 
     // 4. CLOSE COMBAT RANGE (< 1.6m)
     if (distance < 1.6) {
-      const roll = Math.random();
+      const roll = this.rng.next();
 
       if (roll < 0.25) {
         // Fast Light Punch poke
@@ -135,7 +159,7 @@ export class CPUAI {
         input.lp = true;
         input.lk = true;
       } else {
-        // Step back / space
+        // Step back / spacing
         if (self.facingRight) input.left = true;
         else input.right = true;
       }
@@ -144,7 +168,7 @@ export class CPUAI {
 
     // 5. MID / POKING RANGE (1.6m - 3.2m)
     if (distance >= 1.6 && distance <= 3.2) {
-      const roll = Math.random();
+      const roll = this.rng.next();
 
       if (roll < 0.35) {
         // Special move poke (Cover Drive / Yorker Slide)
@@ -174,7 +198,7 @@ export class CPUAI {
     }
 
     // Occasionally jump or dash
-    if (Math.random() < 0.2) {
+    if (this.rng.chance(0.2)) {
       input.up = true;
     }
 

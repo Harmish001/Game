@@ -58,7 +58,9 @@ export class InputManager {
 
   constructor() {
     this.loadCustomBindings();
-    this.setupListeners();
+    if (typeof window !== 'undefined') {
+      this.setupListeners();
+    }
   }
 
   private createEmptyInput(): RawPlayerInput {
@@ -149,7 +151,7 @@ export class InputManager {
     // Combine with Gamepad 0
     this.pollGamepad(0, input);
 
-    return input;
+    return this.cleanSOCD(input);
   }
 
   private pollP2(): RawPlayerInput {
@@ -173,11 +175,28 @@ export class InputManager {
     // Combine with Gamepad 1 (or Gamepad 0 if P1 is using keyboard only)
     this.pollGamepad(1, input);
 
+    return this.cleanSOCD(input);
+  }
+
+  /**
+   * Standard tournament SOCD Cleaner:
+   * Left + Right -> Neutral (both false)
+   * Up + Down -> Up Priority (up=true, down=false)
+   */
+  public cleanSOCD(input: RawPlayerInput): RawPlayerInput {
+    if (input.left && input.right) {
+      input.left = false;
+      input.right = false;
+    }
+    if (input.up && input.down) {
+      input.up = true;
+      input.down = false;
+    }
     return input;
   }
 
   private pollGamepad(padIndex: number, out: RawPlayerInput): void {
-    if (!navigator.getGamepads) return;
+    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
     const gamepads = navigator.getGamepads();
     const gp = gamepads[padIndex];
     if (!gp || !gp.connected) return;
@@ -212,6 +231,7 @@ export class InputManager {
 
   /**
    * Detects motion inputs in the buffer (relative to player facing)
+   * Priority: DP > QCF > QCB > DASH_FWD > DASH_BACK
    */
   public detectMotion(playerIndex: 1 | 2): MotionCommand {
     const buffer = playerIndex === 1 ? this.p1Buffer : this.p2Buffer;
@@ -220,52 +240,27 @@ export class InputManager {
     const latest = buffer[buffer.length - 1];
     const facingRight = latest.facingRight;
 
-    // Check for double tap dash (forward forward or back back)
-    // Within last 14 frames: fwd press, fwd release, fwd press
     const isFwd = (inp: RawPlayerInput) => (facingRight ? inp.right : inp.left);
     const isBack = (inp: RawPlayerInput) => (facingRight ? inp.left : inp.right);
 
-    // Double tap dash forward
-    let fwdTaps = 0;
-    let wasFwd = false;
-    for (let i = buffer.length - 1; i >= 0; i--) {
-      const f = isFwd(buffer[i].input);
-      if (f && !wasFwd) {
-        fwdTaps++;
-        if (fwdTaps >= 2) return 'DASH_FWD';
-      }
-      wasFwd = f;
-    }
-
-    // Double tap dash backward
-    let backTaps = 0;
-    let wasBack = false;
-    for (let i = buffer.length - 1; i >= 0; i--) {
-      const b = isBack(buffer[i].input);
-      if (b && !wasBack) {
-        backTaps++;
-        if (backTaps >= 2) return 'DASH_BACK';
-      }
-      wasBack = b;
-    }
-
-    // Dragon Punch motion: Fwd -> Down -> Down-Fwd (→ ↓ ↘)
+    // 1. Dragon Punch motion with leniency: Fwd -> Down -> (Down-Fwd OR Fwd)
+    // Checked first so DP takes priority over QCF when both could match
     let stageDP = 0;
     for (let i = buffer.length - 1; i >= 0; i--) {
       const inp = buffer[i].input;
       const f = isFwd(inp);
       const d = inp.down;
 
-      if (stageDP === 0 && d && f) {
-        stageDP = 1; // Down-Forward
-      } else if (stageDP === 1 && d && !f) {
-        stageDP = 2; // Down
+      if (stageDP === 0 && f) {
+        stageDP = 1; // Ending on Down-Fwd or Fwd
+      } else if (stageDP === 1 && d) {
+        stageDP = 2; // Middle has Down
       } else if (stageDP === 2 && f && !d) {
-        return 'DP_FWD'; // Forward complete!
+        return 'DP_FWD'; // Started with pure Forward
       }
     }
 
-    // Quarter Circle Forward (↓ ↘ →)
+    // 2. Quarter Circle Forward (↓ ↘ →) with leniency (accept ↓ → skipping ↘)
     let stageQCF = 0;
     for (let i = buffer.length - 1; i >= 0; i--) {
       const inp = buffer[i].input;
@@ -273,15 +268,18 @@ export class InputManager {
       const d = inp.down;
 
       if (stageQCF === 0 && f && !d) {
-        stageQCF = 1; // Forward
+        stageQCF = 1; // Ended on Forward
       } else if (stageQCF === 1 && (f && d)) {
-        stageQCF = 2; // Down-Forward
+        stageQCF = 2; // Found Down-Forward
+      } else if (stageQCF === 1 && (d && !f)) {
+        // Skipped Down-Forward diagonal directly to Down! Valid lenient QCF
+        return 'QCF';
       } else if (stageQCF === 2 && (d && !f)) {
-        return 'QCF'; // Down found!
+        return 'QCF'; // Full Down-Forward to Down complete!
       }
     }
 
-    // Quarter Circle Back (↓ ↙ ←)
+    // 3. Quarter Circle Back (↓ ↙ ←) with leniency (accept ↓ ← skipping ↙)
     let stageQCB = 0;
     for (let i = buffer.length - 1; i >= 0; i--) {
       const inp = buffer[i].input;
@@ -289,12 +287,57 @@ export class InputManager {
       const d = inp.down;
 
       if (stageQCB === 0 && b && !d) {
-        stageQCB = 1; // Back
+        stageQCB = 1; // Ended on Back
       } else if (stageQCB === 1 && (b && d)) {
-        stageQCB = 2; // Down-Back
+        stageQCB = 2; // Found Down-Back
+      } else if (stageQCB === 1 && (d && !b)) {
+        // Skipped Down-Back diagonal directly to Down! Valid lenient QCB
+        return 'QCB';
       } else if (stageQCB === 2 && (d && !b)) {
-        return 'QCB'; // Down found!
+        return 'QCB'; // Full Down-Back to Down complete!
       }
+    }
+
+    // 4. Double tap dash forward (Forward -> Neutral -> Forward)
+    let fwdTaps = 0;
+    let wasFwd = false;
+    let sawNeutralFwd = false;
+    for (let i = buffer.length - 1; i >= 0; i--) {
+      const inp = buffer[i].input;
+      if (inp.down || inp.up) break;
+      const f = isFwd(inp);
+      const isNeutral = !inp.right && !inp.left;
+      if (f && !wasFwd) {
+        if (fwdTaps === 0) {
+          fwdTaps = 1;
+        } else if (fwdTaps === 1 && sawNeutralFwd) {
+          return 'DASH_FWD';
+        }
+      } else if (isNeutral && fwdTaps === 1) {
+        sawNeutralFwd = true;
+      }
+      wasFwd = f;
+    }
+
+    // 5. Double tap dash backward (Back -> Neutral -> Back)
+    let backTaps = 0;
+    let wasBack = false;
+    let sawNeutralBack = false;
+    for (let i = buffer.length - 1; i >= 0; i--) {
+      const inp = buffer[i].input;
+      if (inp.down || inp.up) break;
+      const b = isBack(inp);
+      const isNeutral = !inp.right && !inp.left;
+      if (b && !wasBack) {
+        if (backTaps === 0) {
+          backTaps = 1;
+        } else if (backTaps === 1 && sawNeutralBack) {
+          return 'DASH_BACK';
+        }
+      } else if (isNeutral && backTaps === 1) {
+        sawNeutralBack = true;
+      }
+      wasBack = b;
     }
 
     return 'NONE';
@@ -320,6 +363,7 @@ export class InputManager {
   }
 
   private loadCustomBindings(): void {
+    if (typeof localStorage === 'undefined') return;
     try {
       const s1 = localStorage.getItem('cricket_clash_bindings_p1');
       if (s1) this.p1Keys = { ...this.p1Keys, ...JSON.parse(s1) };
@@ -329,6 +373,7 @@ export class InputManager {
   }
 
   private saveCustomBindings(): void {
+    if (typeof localStorage === 'undefined') return;
     try {
       localStorage.setItem('cricket_clash_bindings_p1', JSON.stringify(this.p1Keys));
       localStorage.setItem('cricket_clash_bindings_p2', JSON.stringify(this.p2Keys));
