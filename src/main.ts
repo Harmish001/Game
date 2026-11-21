@@ -146,12 +146,16 @@ class CricketClashGame {
   private startNewMatch(settings: MatchSettings): void {
     this.endCurrentMatch();
 
-    // Build arena
-    this.sceneManager.buildStadiumArena(settings.arena);
-
-    // Create Fighters
     const p1Profile = CHARACTER_ROSTER[settings.p1Character];
     const p2Profile = CHARACTER_ROSTER[settings.p2Character];
+
+    // Loader covers blank canvas while GLBs download / parse
+    const hudRoot = document.getElementById('hud-container');
+    if (hudRoot) hudRoot.style.visibility = 'hidden';
+    this.screenManager.showMatchLoader(p1Profile.name, p2Profile.name);
+    this.hud.setFighterNames(p1Profile.name, p2Profile.name);
+
+    this.sceneManager.buildStadiumArena(settings.arena);
 
     this.p1 = new Fighter(p1Profile, 1, -3.5, this.sceneManager.scene);
     this.p2 = new Fighter(p2Profile, 2, 3.5, this.sceneManager.scene);
@@ -159,10 +163,8 @@ class CricketClashGame {
     this.p1.projectileSystem = this.projectileSystem;
     this.p2.projectileSystem = this.projectileSystem;
 
-    // Set CPU AI
     this.cpuAI.setDifficulty(settings.difficulty);
 
-    // Create Match Manager
     this.matchManager = new MatchManager(
       settings,
       this.audioManager,
@@ -170,9 +172,7 @@ class CricketClashGame {
       this.vfxSystem
     );
 
-    this.hud.setFighterNames(p1Profile.name, p2Profile.name);
-
-    this.matchManager.onPhaseChange = (phase, bannerText) => {
+    this.matchManager.onPhaseChange = (_phase, bannerText) => {
       this.hud.showBanner(bannerText);
     };
 
@@ -180,8 +180,108 @@ class CricketClashGame {
       this.screenManager.showResults(stats);
     };
 
-    this.matchManager.startMatch(this.p1, this.p2);
-    this.isMatchRunning = true;
+    // Hold FIGHT until both meshes ready (timeout so a failed load never soft-locks)
+    void this.waitForFightersReady().then(() => {
+      if (!this.p1 || !this.p2 || !this.matchManager) return;
+      this.screenManager.hideMatchLoader();
+      if (hudRoot) hudRoot.style.visibility = 'visible';
+      this.matchManager.startMatch(this.p1, this.p2);
+      this.isMatchRunning = true;
+    });
+  }
+
+  private waitForFightersReady(): Promise<void> {
+    const started = performance.now();
+    const TIMEOUT_MS = 45000;
+
+    return new Promise((resolve) => {
+      const tick = () => {
+        const p1m = this.p1?.mesh;
+        const p2m = this.p2?.mesh;
+        const p1Ready = !p1m || p1m.isModelReady();
+        const p2Ready = !p2m || p2m.isModelReady();
+        const p1p = p1m?.loadProgress ?? 1;
+        const p2p = p2m?.loadProgress ?? 1;
+        const avg = (p1p + p2p) * 0.5;
+
+        let hint = 'Preparing fighters…';
+        if (!p1Ready && !p2Ready) hint = 'Loading both fighters…';
+        else if (!p1Ready) hint = `Loading ${this.p1?.profile.name ?? 'P1'}…`;
+        else if (!p2Ready) hint = `Loading ${this.p2?.profile.name ?? 'P2'}…`;
+
+        this.screenManager.updateMatchLoader(avg, hint);
+
+        if (p1Ready && p2Ready) {
+          this.screenManager.updateMatchLoader(1, 'Ready!');
+          resolve();
+          return;
+        }
+        if (performance.now() - started > TIMEOUT_MS) {
+          console.warn('[Match] Fighter load timeout — starting anyway');
+          resolve();
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+
+  /** Drive mixer/pose without advancing fighter sim (hitstop + same-frame react) */
+  private syncFighterMeshes(dt: number): void {
+    for (const f of [this.p1, this.p2]) {
+      if (!f?.mesh) continue;
+      const moveProgress = f.currentMoveExecutor ? f.currentMoveExecutor.getProgress() : 0;
+      const activeMoveId = f.currentMoveExecutor ? f.currentMoveExecutor.move.id : '';
+      const moveDurationSec = f.currentMoveExecutor
+        ? f.currentMoveExecutor.totalFrames / 60
+        : 0;
+      const stateDurationSec = f.stateFramesTarget > 0 ? f.stateFramesTarget / 60 : 0;
+      f.mesh.updateAnimation(
+        f.state,
+        f.stateTimer,
+        f.facingRight,
+        moveProgress,
+        activeMoveId,
+        dt,
+        f.y,
+        moveDurationSec,
+        stateDurationSec,
+        f.animReactNonce,
+        f.isGuarding,
+        f.profile.walkSpeedFwd,
+        f.profile.walkSpeedBack,
+        f.profile.dashSpeed
+      );
+      f.mesh.root.position.set(f.x, f.y, 0);
+    }
+  }
+
+  /** Mech QA snapshot — clip counts, state, guard */
+  public debugFighters(): unknown {
+    const snap = (f: Fighter | null) => {
+      if (!f || !f.mesh) return null;
+      const m = f.mesh as unknown as {
+        modelReady?: boolean;
+        hasSkinnedAnims?: boolean;
+        clipActions?: Map<string, unknown>;
+        activeClipName?: string;
+        hipsBone?: { name: string } | null;
+      };
+      return {
+        id: f.profile.id,
+        state: f.state,
+        x: +f.x.toFixed(2),
+        y: +f.y.toFixed(2),
+        guarding: f.isGuarding,
+        modelReady: !!m.modelReady,
+        skinned: !!m.hasSkinnedAnims,
+        clips: m.clipActions?.size ?? 0,
+        active: m.activeClipName ?? '',
+        hips: m.hipsBone?.name ?? null
+      };
+    };
+    return { p1: snap(this.p1), p2: snap(this.p2) };
   }
 
   private endCurrentMatch(): void {
@@ -206,7 +306,9 @@ class CricketClashGame {
     // 1. Tick VFX and Hitstop
     this.vfxSystem.update(dt);
     if (this.vfxSystem.tickHitstop()) {
-      return; // Freeze combat frames during impact hit-stop!
+      // Freeze physics/input — still sync mesh so Hit_Knockback/Defend show during freeze
+      this.syncFighterMeshes(0);
+      return;
     }
 
     if (!this.isMatchRunning || !this.p1 || !this.p2 || !this.matchManager) {
@@ -262,11 +364,28 @@ class CricketClashGame {
     this.p1.x += pushShift.p1Shift;
     this.p2.x += pushShift.p2Shift;
 
-    // 5. Check Attack Hitboxes vs Hurtboxes & Update Projectiles
+    // 5. Whoosh on active start + combat + projectiles
     if (this.matchManager.phase === 'FIGHTING') {
-      this.projectileSystem.update(dt, this.p1, this.p2);
+      for (const f of [this.p1, this.p2]) {
+        if (f.needsWhoosh()) {
+          const heavy = (f.currentMoveExecutor?.move.hitstop ?? 0) >= 9;
+          this.audioManager.playWhoosh(heavy);
+          f.markWhooshPlayed();
+        }
+        if (f.state === 'THROW_TECH' && f.stateFrames === 1) {
+          this.audioManager.playThrowTech();
+          this.vfxSystem.spawnHitSparks(f.x, f.y + 1.1, 'block');
+        }
+      }
+      const projHits = this.projectileSystem.update(dt, this.p1, this.p2);
+      if (projHits) {
+        for (const h of projHits) {
+          this.applyHitFeel(h.x, h.y, h.result, h.heavy);
+        }
+      }
       this.checkCombatCollisions(this.p1, this.p2);
       this.checkCombatCollisions(this.p2, this.p1);
+      this.syncFighterMeshes(0);
     }
 
     // 6. Update Match Rules & Round Timer
@@ -311,8 +430,6 @@ class CricketClashGame {
     );
 
     let connected = false;
-    let impactX = (hurtWorld.minX + hurtWorld.maxX) * 0.5;
-    let impactY = (hurtWorld.minY + hurtWorld.maxY) * 0.5;
 
     // Tekken-style: fist/foot bone must touch hurtbox during contact anim window
     if (attacker.mesh?.usesVisualStrikes()) {
@@ -321,8 +438,6 @@ class CricketClashGame {
       for (const p of points) {
         if (this.hitboxSystem.pointHitsBox(p.x, p.y, radius, hurtWorld)) {
           connected = true;
-          impactX = p.x;
-          impactY = p.y;
           break;
         }
       }
@@ -336,10 +451,6 @@ class CricketClashGame {
         else hitWorld.maxX = Math.max(hitWorld.maxX, attacker.x + 0.25);
       }
       connected = this.hitboxSystem.checkOverlap(hitWorld, hurtWorld);
-      if (connected) {
-        impactX = (hitWorld.minX + hurtWorld.minX) * 0.5;
-        impactY = (hitWorld.minY + hurtWorld.minY) * 0.5;
-      }
     }
 
     if (!connected) return;
@@ -349,26 +460,55 @@ class CricketClashGame {
     const isThrow = attacker.currentMoveExecutor.move.hitLevel === 'throw';
     const result = defender.takeHit(attacker, attacker.currentMoveExecutor.move, isThrow);
 
+    const contactY = defender.y + (attacker.currentMoveExecutor.move.hitbox?.y ?? 1.1);
+    const contactX = (attacker.x + defender.x) * 0.5;
+    this.applyHitFeel(contactX, contactY, result, (attacker.currentMoveExecutor.move.hitstop ?? 0) >= 9, {
+      sfxType: attacker.currentMoveExecutor.move.sfxType,
+      isLauncher: !!attacker.currentMoveExecutor.move.isLauncher,
+      vfxType: attacker.currentMoveExecutor.move.vfxType
+    });
+  }
+
+  private applyHitFeel(
+    x: number,
+    y: number,
+    result: { hit: boolean; blocked: boolean; counterHit: boolean; hitstop: number; damage: number },
+    heavy: boolean,
+    meta?: { sfxType?: string; isLauncher?: boolean; vfxType?: string }
+  ): void {
+    if (!result.hit && !result.blocked) return;
+
+    this.vfxSystem.setHitstop(result.hitstop);
+
     if (result.blocked) {
       this.audioManager.playBlock();
-      this.vfxSystem.spawnHitSparks(impactX, impactY, 'block');
-    } else {
-      const sfxType = attacker.currentMoveExecutor.move.sfxType;
-      if (sfxType === 'heavy_hit' || sfxType === 'bat_hit') this.audioManager.playHeavyHit();
-      else if (sfxType === 'super') this.audioManager.playSuperFlash();
-      else this.audioManager.playLightHit();
-
-      const vfxType = attacker.currentMoveExecutor.move.vfxType;
-      this.vfxSystem.spawnHitSparks(
-        impactX,
-        impactY,
-        vfxType === 'super' ? 'super' : 'heavy'
-      );
-
-      const intensity = vfxType === 'super' ? 0.45 : vfxType === 'sparks' ? 0.25 : 0.12;
-      this.sceneManager.triggerScreenShake(intensity, 0.2);
-      this.vfxSystem.setHitstop(result.hitstop);
+      this.vfxSystem.spawnHitSparks(x, y, 'block');
+      this.sceneManager.triggerScreenShake(0.04, 0.08);
+      return;
     }
+
+    if (result.counterHit) {
+      this.audioManager.playCounterHit();
+      this.vfxSystem.spawnHitSparks(x, y, 'counter');
+      this.hud.flashCounter();
+      this.sceneManager.triggerScreenShake(0.35, 0.22);
+      this.sceneManager.punchCamera(3);
+      return;
+    }
+
+    const sfx = meta?.sfxType;
+    if (sfx === 'super') this.audioManager.playSuperFlash();
+    else if (sfx === 'heavy_hit' || sfx === 'bat_hit' || heavy) this.audioManager.playHeavyHit();
+    else this.audioManager.playLightHit();
+
+    const sparkType =
+      sfx === 'super' ? 'super' : heavy || meta?.isLauncher ? 'heavy' : result.damage >= 10 ? 'medium' : 'light';
+    this.vfxSystem.spawnHitSparks(x, y, sparkType as 'light' | 'medium' | 'heavy' | 'super');
+
+    const intensity =
+      meta?.vfxType === 'super' ? 0.45 : meta?.isLauncher || heavy ? 0.28 : 0.1;
+    this.sceneManager.triggerScreenShake(intensity, heavy ? 0.22 : 0.12);
+    if (heavy || meta?.isLauncher) this.sceneManager.punchCamera(2.5);
   }
 
   private updateDebugHitboxes(): void {
@@ -436,5 +576,7 @@ class CricketClashGame {
 
 // Start game when DOM is loaded
 window.addEventListener('DOMContentLoaded', () => {
-  new CricketClashGame();
+  const game = new CricketClashGame();
+  // ponytail: debug hook for mech QA — remove when tooling exists
+  (window as unknown as { __clash?: CricketClashGame }).__clash = game;
 });

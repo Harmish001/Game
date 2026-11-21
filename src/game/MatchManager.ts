@@ -98,14 +98,14 @@ export class MatchManager {
 
     switch (this.phase) {
       case 'ROUND_INTRO': {
-        // Long enough for Rohit Bow_RT (~3.75s) then FIGHT
-        if (this.phaseTimer >= 3.6 && this.phaseTimer - dt < 3.6) {
+        // Intros ~1.2–1.5s (Meditate / Jumping_Jacks / etc.) then FIGHT
+        if (this.phaseTimer >= 2.2 && this.phaseTimer - dt < 2.2) {
           this.audio?.playAnnouncer('fight');
           if (this.onPhaseChange) {
             this.onPhaseChange(this.phase, 'FIGHT!');
           }
         }
-        if (this.phaseTimer >= 4.2) {
+        if (this.phaseTimer >= 2.8) {
           this.phase = 'FIGHTING';
           this.phaseTimer = 0;
           this.audio?.startBattleMusic();

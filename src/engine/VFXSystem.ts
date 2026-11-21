@@ -59,16 +59,38 @@ export class VFXSystem {
   public spawnHitSparks(
     x: number,
     y: number,
-    type: 'light' | 'heavy' | 'bat' | 'block' | 'super' = 'light'
+    type: 'light' | 'medium' | 'heavy' | 'bat' | 'block' | 'counter' | 'super' = 'light'
   ): void {
-    const count = type === 'super' ? 32 : type === 'heavy' || type === 'bat' ? 18 : 8;
+    const count =
+      type === 'super'
+        ? 36
+        : type === 'counter'
+          ? 28
+          : type === 'heavy' || type === 'bat'
+            ? 20
+            : type === 'medium'
+              ? 14
+              : type === 'block'
+                ? 10
+                : 8;
     const baseColor =
-      type === 'block' ? 0x60a5fa : // Blue for block
-      type === 'bat' ? 0xf59e0b :   // Gold sparks for bat
-      type === 'super' ? 0xef4444 : // Red fire for super
-      0xfacc15;                    // Yellow for normals
+      type === 'block'
+        ? 0x93c5fd
+        : type === 'counter'
+          ? 0xf97316
+          : type === 'bat'
+            ? 0xf59e0b
+            : type === 'super'
+              ? 0xef4444
+              : type === 'heavy'
+                ? 0xfde68a
+                : 0xf8fafc;
 
-    const sparkGeo = new THREE.SphereGeometry(type === 'heavy' ? 0.08 : 0.05, 4, 4);
+    const sparkGeo = new THREE.SphereGeometry(
+      type === 'heavy' || type === 'counter' || type === 'super' ? 0.09 : 0.05,
+      4,
+      4
+    );
 
     for (let i = 0; i < count; i++) {
       const sparkMat = new THREE.MeshBasicMaterial({
@@ -77,34 +99,62 @@ export class VFXSystem {
         opacity: 1.0
       });
       const sparkMesh = new THREE.Mesh(sparkGeo, sparkMat);
-      sparkMesh.position.set(x, y, (Math.random() - 0.5) * 0.4);
+      sparkMesh.position.set(x, y, (Math.random() - 0.5) * 0.35);
 
       const angle = Math.random() * Math.PI * 2;
-      const speed = 2.5 + Math.random() * (type === 'heavy' ? 6 : 4);
+      const speed = 2.2 + Math.random() * (type === 'heavy' || type === 'counter' ? 7 : 4);
       const vel = new THREE.Vector3(
         Math.cos(angle) * speed,
-        Math.sin(angle) * speed + 1.5,
-        (Math.random() - 0.5) * 1.5
+        Math.sin(angle) * speed + 1.2,
+        (Math.random() - 0.5) * 1.2
       );
 
-      const life = 0.15 + Math.random() * 0.25;
+      const life =
+        type === 'light' ? 0.08 + Math.random() * 0.08 : 0.14 + Math.random() * 0.22;
 
       this.particleGroup.add(sparkMesh);
       this.activeParticles.push({
         mesh: sparkMesh,
         velocity: vel,
-        life: life,
+        life,
         maxLife: life,
-        scaleGrowth: -0.6
+        scaleGrowth: type === 'block' ? -0.3 : -0.7
       });
     }
 
-    // Trigger hit flash
-    if (type === 'heavy' || type === 'bat') {
-      this.triggerScreenFlash(0.3, 0.08);
+    // Shockwave ring on medium+
+    if (type !== 'light' && type !== 'block') {
+      this.spawnShockwaveRing(x, y, type === 'super' || type === 'counter' ? 1.4 : 0.9);
+    }
+
+    if (type === 'heavy' || type === 'bat' || type === 'counter') {
+      this.triggerScreenFlash(0.28, 0.07);
     } else if (type === 'super') {
       this.triggerScreenFlash(0.7, 0.2);
     }
+  }
+
+  public spawnShockwaveRing(x: number, y: number, strength: number = 1): void {
+    const geo = new THREE.RingGeometry(0.05, 0.12, 24);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.85,
+      side: THREE.DoubleSide,
+      depthTest: false
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, 0.15);
+    mesh.rotation.x = -Math.PI / 2;
+    const life = 0.18;
+    this.particleGroup.add(mesh);
+    this.activeParticles.push({
+      mesh,
+      velocity: new THREE.Vector3(0, 0, 0),
+      life,
+      maxLife: life,
+      scaleGrowth: 8 * strength
+    });
   }
 
   // --- DUST PUFFS ---

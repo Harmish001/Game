@@ -58,8 +58,10 @@ export class MoveExecutor {
   public isInVisualDamageWindow(): boolean {
     if (this.hasHit || !this.move.hitbox) return false;
     if (this.isFinished()) return false;
-    const windupEnd = Math.max(1, Math.floor(this.move.startup * 0.35));
-    return this.currentFrame >= windupEnd;
+    // Allow connect from late startup through active (+ a bit of recovery for slow kicks)
+    const windupEnd = Math.max(1, Math.floor(this.move.startup * 0.45));
+    const activeEnd = this.move.startup + this.move.active + Math.max(1, Math.floor(this.move.recovery * 0.15));
+    return this.currentFrame >= windupEnd && this.currentFrame < activeEnd;
   }
 
   public canCancelInto(nextMoveId: string): boolean {

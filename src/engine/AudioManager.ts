@@ -52,7 +52,7 @@ export class AudioManager {
     const osc = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
     osc.type = 'triangle';
-    osc.frequency.setValueAtTime(280, t);
+    osc.frequency.setValueAtTime(this.pitchJitter(280), t);
     osc.frequency.exponentialRampToValueAtTime(80, t + 0.08);
 
     // Click noise burst
@@ -75,6 +75,7 @@ export class AudioManager {
     osc.start(t);
     osc.stop(t + 0.1);
     noiseSource.start(t);
+    this.rumble(0.25, 40);
   }
 
   public playHeavyHit(): void {
@@ -86,7 +87,7 @@ export class AudioManager {
     const osc = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(180, t);
+    osc.frequency.setValueAtTime(this.pitchJitter(180), t);
     osc.frequency.exponentialRampToValueAtTime(35, t + 0.22);
 
     // Distortion / grit
@@ -124,6 +125,7 @@ export class AudioManager {
     distortionOsc.start(t);
     distortionOsc.stop(t + 0.14);
     noiseSource.start(t);
+    this.rumble(0.75, 120);
   }
 
   public playBatHit(): void {
@@ -171,6 +173,10 @@ export class AudioManager {
     noiseSource.start(t);
   }
 
+  private pitchJitter(base: number): number {
+    return base * (0.95 + Math.random() * 0.1);
+  }
+
   public playBlock(): void {
     this.ensureAudioStarted();
     if (!this.ctx || !this.sfxGain) return;
@@ -179,10 +185,10 @@ export class AudioManager {
     const osc = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
     osc.type = 'triangle';
-    osc.frequency.setValueAtTime(520, t);
+    osc.frequency.setValueAtTime(this.pitchJitter(520), t);
     osc.frequency.exponentialRampToValueAtTime(200, t + 0.08);
 
-    gain.gain.setValueAtTime(0.6, t);
+    gain.gain.setValueAtTime(0.55, t);
     gain.gain.exponentialRampToValueAtTime(0.01, t + 0.08);
 
     osc.connect(gain);
@@ -190,32 +196,96 @@ export class AudioManager {
 
     osc.start(t);
     osc.stop(t + 0.09);
+    this.rumble(0.15, 30);
   }
 
-  public playWhoosh(): void {
+  public playWhoosh(heavy: boolean = false): void {
     this.ensureAudioStarted();
     if (!this.ctx || !this.sfxGain) return;
     const t = this.ctx.currentTime;
 
-    const noise = this.createNoiseBuffer(0.16);
+    const noise = this.createNoiseBuffer(heavy ? 0.2 : 0.14);
     const filter = this.ctx.createBiquadFilter();
     filter.type = 'bandpass';
-    filter.frequency.setValueAtTime(300, t);
-    filter.frequency.exponentialRampToValueAtTime(1200, t + 0.07);
-    filter.frequency.exponentialRampToValueAtTime(250, t + 0.16);
-    filter.Q.value = 3.0;
+    filter.frequency.setValueAtTime(this.pitchJitter(heavy ? 220 : 320), t);
+    filter.frequency.exponentialRampToValueAtTime(heavy ? 900 : 1300, t + 0.06);
+    filter.frequency.exponentialRampToValueAtTime(220, t + (heavy ? 0.2 : 0.14));
+    filter.Q.value = 2.8;
 
     const noiseSource = this.ctx.createBufferSource();
     noiseSource.buffer = noise;
     const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0.4, t);
-    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.16);
+    gain.gain.setValueAtTime(heavy ? 0.55 : 0.38, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + (heavy ? 0.2 : 0.14));
 
     noiseSource.connect(filter);
     filter.connect(gain);
     gain.connect(this.sfxGain);
 
     noiseSource.start(t);
+  }
+
+  /** Sharp crack layered on counter hits */
+  public playCounterHit(): void {
+    this.ensureAudioStarted();
+    if (!this.ctx || !this.sfxGain) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(this.pitchJitter(880), t);
+    osc.frequency.exponentialRampToValueAtTime(140, t + 0.1);
+    gain.gain.setValueAtTime(0.7, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.12);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.13);
+
+    const noise = this.createNoiseBuffer(0.06);
+    const ns = this.ctx.createBufferSource();
+    ns.buffer = noise;
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.85, t);
+    ng.gain.exponentialRampToValueAtTime(0.01, t + 0.06);
+    ns.connect(ng);
+    ng.connect(this.sfxGain);
+    ns.start(t);
+    this.rumble(0.85, 110);
+  }
+
+  public playThrowTech(): void {
+    this.ensureAudioStarted();
+    if (!this.ctx || !this.sfxGain) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(660, t);
+    osc.frequency.exponentialRampToValueAtTime(220, t + 0.15);
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.16);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.17);
+  }
+
+  public rumble(strength: number, ms: number): void {
+    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
+    for (const gp of navigator.getGamepads()) {
+      if (!gp || !gp.vibrationActuator) continue;
+      try {
+        gp.vibrationActuator.playEffect('dual-rumble', {
+          startDelay: 0,
+          duration: ms,
+          weakMagnitude: Math.min(1, strength * 0.6),
+          strongMagnitude: Math.min(1, strength)
+        });
+      } catch {
+        /* ignore unsupported pads */
+      }
+    }
   }
 
   public playSuperFlash(): void {

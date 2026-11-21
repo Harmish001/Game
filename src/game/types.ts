@@ -39,7 +39,13 @@ export type FighterState =
   | "WIN"
   | "LOSE";
 
-export type HitLevel = "high" | "mid" | "low" | "throw" | "unblockable";
+export type HitLevel =
+  | "high"
+  | "mid"
+  | "low"
+  | "overhead"
+  | "throw"
+  | "unblockable";
 
 export interface ProjectileDef {
   id: string;
@@ -94,6 +100,13 @@ export interface MoveFrameData {
   isLauncher?: boolean; // sends target into air for juggle
   isHardKnockdown?: boolean; // forces floor knockdown
   isArmored?: boolean; // absorbs 1 hit during startup
+  isOverhead?: boolean; // must block standing (alias of hitLevel overhead)
+  isAntiAir?: boolean; // tall hitbox / air-control tool
+  isReversal?: boolean; // invincible reversal (limit 1/char)
+  invincibleStartupFrames?: number;
+  throwBreakWindow?: number; // frames defender can tech (12–20)
+  pushbackOnBlock?: number;
+  pushbackOnHit?: number;
   projectileDef?: ProjectileDef; // data-driven projectile spawned during move
   projectileSpawnFrame?: number; // frame index in move to spawn projectile
   vfxType?:
@@ -128,9 +141,19 @@ export interface CharacterProfile {
   walkSpeedBack: number;
   dashSpeed: number;
   dashFrames: number;
+  /** Backdash length (default dashFrames+4) */
+  backdashFrames?: number;
+  /** Backdash i-frames (default 5) */
+  backdashInvulnFrames?: number;
+  /** Forward dash cancelable into attack from this frame (default 10) */
+  dashCancelFrom?: number;
   jumpVelocityY: number;
   gravity: number;
   maxHealth: number;
+  /** One-liner game plan for select screen */
+  gamePlan?: string;
+  strengthZone?: "close" | "mid" | "far";
+  weakness?: string;
   colorScheme: {
     primary: number;
     secondary: number;

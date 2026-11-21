@@ -1,6 +1,13 @@
 import * as THREE from "three";
-import { ProjectileDef, ProjectileSimState, Box2D } from "../types";
-import { Fighter } from "../Fighter";
+import { ProjectileDef, ProjectileSimState } from "../types";
+import { Fighter, HitResult } from "../Fighter";
+
+export interface ProjectileHitEvent {
+  x: number;
+  y: number;
+  result: HitResult;
+  heavy: boolean;
+}
 
 export class ProjectileSystem {
   public projectiles: ProjectileSimState[] = [];
@@ -75,7 +82,8 @@ export class ProjectileSystem {
   /**
    * Update all projectiles for 1 simulation frame (1/60s).
    */
-  public update(dt: number, p1: Fighter, p2: Fighter): void {
+  public update(dt: number, p1: Fighter, p2: Fighter): ProjectileHitEvent[] {
+    const hits: ProjectileHitEvent[] = [];
     // 1. Advance physics & lifetime
     for (const p of this.projectiles) {
       if (!p.isActive) continue;
@@ -119,7 +127,13 @@ export class ProjectileSystem {
 
       if (this.checkFighterOverlap(p, defender)) {
         p.hasHit = true;
-        this.applyHitToDefender(p, attacker, defender);
+        const result = this.applyHitToDefender(p, attacker, defender);
+        hits.push({
+          x: p.x,
+          y: p.y,
+          result,
+          heavy: p.def.hitstop >= 8 || p.def.damage >= 14
+        });
 
         if (p.def.destroyOnHit) {
           p.isActive = false;
@@ -129,6 +143,7 @@ export class ProjectileSystem {
 
     // 4. Update visual meshes & cleanup dead ones
     this.syncVisuals();
+    return hits;
   }
 
   /**
@@ -205,8 +220,7 @@ export class ProjectileSystem {
     p: ProjectileSimState,
     attacker: Fighter,
     defender: Fighter,
-  ): void {
-    // Projectiles act as simulated moves
+  ): HitResult {
     const pseudoMove = {
       id: p.def.id,
       name: p.def.name,
@@ -225,7 +239,7 @@ export class ProjectileSystem {
       meterGain: p.def.meterGain,
     };
 
-    defender.takeHit(attacker, pseudoMove, false);
+    return defender.takeHit(attacker, pseudoMove, false);
   }
 
   private syncVisuals(): void {

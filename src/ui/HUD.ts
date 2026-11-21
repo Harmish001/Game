@@ -20,9 +20,14 @@ export class HUD {
   private timerEl: HTMLElement | null = null;
   private bannerEl: HTMLElement | null = null;
   private comboEl: HTMLElement | null = null;
+  private counterEl: HTMLElement | null = null;
+  private comboDamageEl: HTMLElement | null = null;
+  private counterFlashTimer: number = 0;
 
   private p1DelayedHp: number = 100;
   private p2DelayedHp: number = 100;
+  private p1GhostHold: number = 0;
+  private p2GhostHold: number = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -318,6 +323,37 @@ export class HUD {
           text-shadow: 0 0 20px #ea580c, 0 0 40px rgba(234,88,12,0.4);
         }
 
+        .combo-damage {
+          display: block;
+          font-family: 'Rajdhani', sans-serif;
+          font-size: 1.4rem;
+          font-weight: 700;
+          color: #fde68a;
+          letter-spacing: 2px;
+          text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+        }
+
+        .counter-tag {
+          position: absolute;
+          top: 42%;
+          left: 50%;
+          transform: translate(-50%, -50%) scale(0.6);
+          font-family: 'Teko', sans-serif;
+          font-size: 3.2rem;
+          font-weight: 700;
+          letter-spacing: 6px;
+          color: #fb923c;
+          text-shadow: 0 0 18px rgba(249,115,22,0.85), 0 4px 12px #000;
+          opacity: 0;
+          pointer-events: none;
+          transition: opacity 0.1s ease, transform 0.1s ease;
+        }
+
+        .counter-tag.visible {
+          opacity: 1;
+          transform: translate(-50%, -50%) scale(1);
+        }
+
         .combo-label {
           font-family: 'Rajdhani', sans-serif;
           font-size: 1rem;
@@ -503,7 +539,9 @@ export class HUD {
           <div id="combo-counter" class="combo-counter">
             <span id="combo-hits" class="combo-hits">2</span>
             <span class="combo-label">HIT COMBO</span>
+            <span id="combo-damage" class="combo-damage">0 dmg</span>
           </div>
+          <div id="counter-tag" class="counter-tag">COUNTER</div>
         </div>
 
         <!-- BOTTOM: Super Meters -->
@@ -552,9 +590,16 @@ export class HUD {
     this.timerEl = this.container.querySelector('#round-timer');
     this.bannerEl = this.container.querySelector('#announcer-banner');
     this.comboEl = this.container.querySelector('#combo-counter');
+    this.comboDamageEl = this.container.querySelector('#combo-damage');
+    this.counterEl = this.container.querySelector('#counter-tag');
 
     this.p1RoundPips = Array.from(this.container.querySelectorAll('.p1-pip'));
     this.p2RoundPips = Array.from(this.container.querySelectorAll('.p2-pip'));
+  }
+
+  public flashCounter(): void {
+    this.counterFlashTimer = 0.55;
+    if (this.counterEl) this.counterEl.classList.add('visible');
   }
 
   public setFighterNames(p1Name: string, p2Name: string): void {
@@ -589,12 +634,25 @@ export class HUD {
       (this.p2HealthFill as HTMLElement).style.backgroundPosition = `${p2HpPercent}% center`;
     }
 
-    // Chip delay catch-up
-    this.p1DelayedHp = THREE.MathUtils.lerp(this.p1DelayedHp, p1HpPercent, dt * 4);
-    this.p2DelayedHp = THREE.MathUtils.lerp(this.p2DelayedHp, p2HpPercent, dt * 4);
+    // Ghost bar: hold ~0.5s then drain (guide)
+    if (p1HpPercent < this.p1DelayedHp - 0.2) this.p1GhostHold = 0.5;
+    if (p2HpPercent < this.p2DelayedHp - 0.2) this.p2GhostHold = 0.5;
+    if (this.p1GhostHold > 0) this.p1GhostHold -= dt;
+    else this.p1DelayedHp = THREE.MathUtils.lerp(this.p1DelayedHp, p1HpPercent, dt * 3);
+    if (this.p2GhostHold > 0) this.p2GhostHold -= dt;
+    else this.p2DelayedHp = THREE.MathUtils.lerp(this.p2DelayedHp, p2HpPercent, dt * 3);
+    if (p1HpPercent > this.p1DelayedHp) this.p1DelayedHp = p1HpPercent;
+    if (p2HpPercent > this.p2DelayedHp) this.p2DelayedHp = p2HpPercent;
 
     if (this.p1HealthDelay) this.p1HealthDelay.style.width = `${this.p1DelayedHp}%`;
     if (this.p2HealthDelay) this.p2HealthDelay.style.width = `${this.p2DelayedHp}%`;
+
+    if (this.counterFlashTimer > 0) {
+      this.counterFlashTimer -= dt;
+      if (this.counterFlashTimer <= 0 && this.counterEl) {
+        this.counterEl.classList.remove('visible');
+      }
+    }
 
     // 1b. Guard Gauges
     if (this.p1GuardFill) {
@@ -645,13 +703,17 @@ export class HUD {
       pip.classList.toggle('active', idx < match.p2RoundsWon);
     });
 
-    // 5. Combo Counter
+    // 5. Combo Counter + damage total (victim side = being combo'd)
     if (this.comboEl) {
-      const activeCombo = p1.comboHitCount > 1 ? p1.comboHitCount : p2.comboHitCount > 1 ? p2.comboHitCount : 0;
+      const victim = p1.comboHitCount >= p2.comboHitCount ? p1 : p2;
+      const activeCombo = victim.comboHitCount > 1 ? victim.comboHitCount : 0;
       if (activeCombo > 1) {
         this.comboEl.classList.add('visible');
         const hitsEl = this.container.querySelector('#combo-hits');
         if (hitsEl) hitsEl.textContent = `${activeCombo}`;
+        if (this.comboDamageEl) {
+          this.comboDamageEl.textContent = `${victim.comboDamageTotal} dmg`;
+        }
       } else {
         this.comboEl.classList.remove('visible');
       }

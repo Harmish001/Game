@@ -46,11 +46,14 @@ fighterIds.forEach(id => {
 
   // Move checks
   const moveKeys = Object.keys(profile.moves);
-  assert(moveKeys.length >= 8, `[${id}] has at least 8 moves (has ${moveKeys.length})`);
+  assert(moveKeys.length >= 20, `[${id}] has at least 20 moves (has ${moveKeys.length})`);
   assert(!!profile.moves.lp, `[${id}] has Light Punch`);
   assert(!!profile.moves.hp, `[${id}] has Heavy Punch`);
   assert(!!profile.moves.lk, `[${id}] has Light Kick`);
   assert(!!profile.moves.hk, `[${id}] has Heavy Kick`);
+  assert(!!profile.moves.overhead, `[${id}] has Overhead`);
+  assert(!!profile.moves.anti_air, `[${id}] has Anti-Air`);
+  assert(!!profile.moves.throw, `[${id}] has Throw`);
   assert(!!profile.moves.special_1, `[${id}] has Special Move 1`);
   assert(!!profile.moves.super, `[${id}] has Super Move`);
 
@@ -100,36 +103,33 @@ assert(Math.abs(pushShift.p1Shift + pushShift.p2Shift) < 0.0001, 'Push resolutio
 
 // 3. MOVE EXECUTOR & FRAME TIMING
 console.log('\n--- 3. Testing Move Executor & Frame Sequences ---');
-const testMove = CHARACTER_ROSTER.opener.moves.lp; // Startup: 5, Active: 3, Recovery: 8 -> Total: 16
+const testMove = CHARACTER_ROSTER.opener.moves.lp;
 const executor = new MoveExecutor(testMove);
+const startF = testMove.startup;
+const activeF = testMove.active;
+const recF = testMove.recovery;
+const totalF = startF + activeF + recF;
 
 assert(executor.isStartup() === true && executor.isActive() === false, 'Frame 0 is startup');
 
-// Tick 4 times (Frame 4)
-for (let i = 0; i < 4; i++) executor.tick();
-assert(executor.isStartup() === true, 'Frame 4 is still startup');
+for (let i = 0; i < startF - 1; i++) executor.tick();
+assert(executor.isStartup() === true, `Frame ${startF - 1} is still startup`);
 
-// Tick to Frame 5 (Active starts)
 executor.tick();
-assert(executor.isActive() === true && executor.isStartup() === false, 'Frame 5 is active');
+assert(executor.isActive() === true && executor.isStartup() === false, `Frame ${startF} is active`);
 assert(executor.getActiveHitbox() !== null, 'Hitbox emitted during active frames');
 
-// Tick to Frame 8 (Active ends, Recovery starts)
-for (let i = 0; i < 3; i++) executor.tick();
-assert(executor.isRecovery() === true && executor.isActive() === false, 'Frame 8 is recovery');
+for (let i = 0; i < activeF; i++) executor.tick();
+assert(executor.isRecovery() === true && executor.isActive() === false, 'Recovery after active');
 
-// Tick to completion
-for (let i = 0; i < 8; i++) executor.tick();
-assert(executor.isFinished() === true, 'Frame 16 move is finished');
+for (let i = 0; i < recF; i++) executor.tick();
+assert(executor.isFinished() === true, `Move finished at frame ${totalF}`);
 
 // 4. CANCEL SYSTEM
 console.log('\n--- 4. Testing Cancel Windows (Gatling Combos) ---');
 const cancelExecutor = new MoveExecutor(testMove);
-// Advance to active
-for (let i = 0; i < 5; i++) cancelExecutor.tick();
-// Without hitting, cancel should be false
+for (let i = 0; i < startF; i++) cancelExecutor.tick();
 assert(cancelExecutor.canCancelInto('hp') === false, 'Cannot cancel without hit confirmed');
-// Confirm hit
 cancelExecutor.hasHit = true;
 assert(cancelExecutor.canCancelInto('hp') === true, 'Can cancel into Heavy Punch on hit confirm');
 assert(cancelExecutor.canCancelInto('special_1') === true, 'Can cancel into Special 1 on hit confirm');
@@ -155,19 +155,18 @@ difficulties.forEach(diff => {
 // 6. BALANCE & COMBO SCALING FORMULA
 console.log('\n--- 6. Testing Combo Scaling & Counter Hit Math ---');
 function calcScaledDamage(baseDamage: number, hitCount: number, isCounter: boolean): number {
-  let scale = 1.0;
-  if (hitCount === 2) scale = 0.85;
-  else if (hitCount === 3) scale = 0.75;
-  else if (hitCount >= 4) scale = 0.6;
-  if (isCounter) scale *= 1.25;
+  const table = [1, 0.9, 0.8, 0.7, 0.6];
+  let scale = hitCount <= 5 ? table[hitCount - 1] : 0.4;
+  if (isCounter) scale *= 1.35;
   return Math.max(1, Math.round(baseDamage * scale));
 }
 
 assert(calcScaledDamage(20, 1, false) === 20, 'Hit 1 deals 100% damage');
-assert(calcScaledDamage(20, 2, false) === 17, 'Hit 2 scaled to 85% damage (17 dmg)');
-assert(calcScaledDamage(20, 3, false) === 15, 'Hit 3 scaled to 75% damage (15 dmg)');
-assert(calcScaledDamage(20, 4, false) === 12, 'Hit 4 scaled to 60% damage floor (12 dmg)');
-assert(calcScaledDamage(20, 1, true) === 25, 'Counter hit adds 25% bonus (25 dmg)');
+assert(calcScaledDamage(20, 2, false) === 18, 'Hit 2 scaled to 90% damage (18 dmg)');
+assert(calcScaledDamage(20, 3, false) === 16, 'Hit 3 scaled to 80% damage (16 dmg)');
+assert(calcScaledDamage(20, 4, false) === 14, 'Hit 4 scaled to 70% damage (14 dmg)');
+assert(calcScaledDamage(20, 6, false) === 8, 'Hit 6 floor 40% (8 dmg)');
+assert(calcScaledDamage(20, 1, true) === 27, 'Counter hit ~1.35x (27 dmg)');
 
 // 7. CLOSE-RANGE HITBOX REGISTRATION & COVERAGE
 console.log('\n--- 7. Testing Close-Range Hitbox Registration ---');
@@ -203,12 +202,13 @@ if (isDefending && !isThrow && dummyMove.hitLevel !== 'unblockable') {
 }
 assert(blockDamage === 0, 'Normal attacks deal 0 damage on block');
 
-const specialMove = CHARACTER_ROSTER.opener.moves.special_1; // damage: 17, chipDamage: 3
+const specialMove = CHARACTER_ROSTER.opener.moves.special_1;
 let specialBlockDmg = 0;
 if (isDefending && !isThrow && specialMove.hitLevel !== 'unblockable') {
   specialBlockDmg = specialMove.chipDamage || 0;
 }
-assert(specialBlockDmg === 3, 'Special attacks deal chip damage only (3 dmg vs 17 full)');
+assert(specialBlockDmg === (specialMove.chipDamage || 0), 'Special attacks deal chip on block');
+assert((specialMove.chipDamage || 0) > 0, 'Special has chip damage');
 
 // 9. CANCEL GRAPH CYCLE DETECTION (Infinite Combo Prevention)
 console.log('\n--- 9. Testing Cancel Graph Directed Acyclic Structure ---');
@@ -386,7 +386,7 @@ wakeFighter.vy = -5.0;
 // Tick physics down to floor
 (wakeFighter as any).applyPhysics(1 / 60);
 assert(wakeFighter.state === 'JUMP_LAND', 'Touching ground transitions to JUMP_LAND');
-assert((wakeFighter as any).stateFramesTarget === 7, 'Whiffed aerial attack incurs 7 frames landing recovery (vs 3 normal)');
+assert((wakeFighter as any).stateFramesTarget === 8, 'Whiffed aerial attack incurs 8 frames landing recovery (vs 4 normal)');
 
 // 16. THROW RULES & WHIFF RECOVERY (Section 2.3)
 console.log('\n--- 16. Testing Throw Rules & Whiff ---');
@@ -614,14 +614,19 @@ console.log('\n--- 20. Testing Character Differentiation (Section 5) ---');
   ashwin.update(kickFeintInput, 'NONE', 2.0, 1 / 60);
   assert(ashwin.meter === 40 && ashwin.state === 'IDLE', 'Ashwin Googly feint cancels startup into neutral for 10% meter');
 
-  // 4. Bumrah Run-Up Dash Cancel
+  // 4. Bumrah Run-Up Dash Cancel (cancelable from dashCancelFrom)
   const bumrah = new Fighter(CHARACTER_ROSTER['quickie'], 1, 0.0);
   bumrah.state = 'DASH_FWD';
+  bumrah.stateFrames = 0;
+  const idleDash = { up: false, down: false, left: false, right: false, lp: false, hp: false, lk: false, hk: false, block: false, special: false, super: false, pause: false };
+  const cancelFrom = bumrah.profile.dashCancelFrom ?? 8;
+  for (let f = 0; f < cancelFrom; f++) {
+    bumrah.update(idleDash, 'NONE', 2.0, 1 / 60);
+  }
   const punchInput = { up: false, down: false, left: false, right: false, lp: true, hp: false, lk: false, hk: false, block: false, special: false, super: false, pause: false };
   bumrah.update(punchInput, 'NONE', 2.0, 1 / 60);
   assert(bumrah.runUpActive === true, 'Bumrah dash-cancel activates Run-Up reach bonus');
-  // Advance through startup (3 frames) into active window
-  const idleInput = { up: false, down: false, left: false, right: false, lp: false, hp: false, lk: false, hk: false, block: false, special: false, super: false, pause: false };
+  const idleInput = idleDash;
   for (let f = 0; f < bumrah.profile.moves.lp.startup; f++) {
     bumrah.update(idleInput, 'NONE', 2.0, 1 / 60);
   }
@@ -657,30 +662,35 @@ console.log('\n--- 21. Testing Combo System & Juggles (Section 4) ---');
   def.takeHit(att, att.profile.moves.lp);
   assert(def.juggleCount === 2 && def.state === 'JUMPING', 'Aerial juggle hit 2 accepted');
 
-  // Aerial Juggle 3 (Juggle limit reached)
+  // Aerial juggles 3–4 still allowed; 5th forces knockdown (guide 5–6)
   def.y = 1.0;
   def.takeHit(att, att.profile.moves.lp);
-  assert(def.juggleCount >= 3 && def.state === 'KNOCKDOWN', 'Juggle limit (3 hits) forces hard knockdown');
+  assert(def.juggleCount === 3 && def.state === 'JUMPING', 'Aerial juggle hit 3 accepted');
+  def.y = 0.9;
+  def.takeHit(att, att.profile.moves.lp);
+  assert(def.juggleCount === 4 && def.state === 'JUMPING', 'Aerial juggle hit 4 accepted');
+  def.y = 0.8;
+  def.takeHit(att, att.profile.moves.lp);
+  assert(def.juggleCount >= 5 && def.state === 'KNOCKDOWN', 'Juggle limit (5 hits) forces hard knockdown');
 
-  // 2. Wall Bounce (Within 1.5 units of ±11.0 stage edge)
-  def.resetForRound(10.0, false); // Within 1.5 of +11.0
+  // 2. Wall Bounce — needs launcher or kb.x >= 3 near corner
+  def.resetForRound(10.0, false);
   assert(Math.abs(def.x) >= 9.5, 'Defender placed in wall bounce zone');
-  const heavyHit = att.profile.moves.hp; // heavy knockback
-  def.takeHit(att, heavyHit);
+  const wallHit = att.profile.moves.special_1; // kb.x 4.0 + armored
+  def.takeHit(att, wallHit);
   assert(def.wallBounceCount === 1, 'Wall bounce triggered on heavy hit near corner');
   assert(def.vx < 0, 'Wall bounce reverses horizontal momentum toward center stage');
   assert(def.wallBounceDamagePenalty === true, 'Wall bounce marks subsequent hit for 50% damage penalty cap');
 
-  // 3. Starter Damage Scaling
+  // 3. Starter Damage — first hit always 100% (guide scaling table)
   const freshTarget1 = new Fighter(CHARACTER_ROSTER['opener'], 2, 0.0);
-  freshTarget1.takeHit(att, att.profile.moves.lp); // Light starter
+  freshTarget1.takeHit(att, att.profile.moves.lp);
   const dmgLight = freshTarget1.maxHealth - freshTarget1.health;
-
   const freshTarget2 = new Fighter(CHARACTER_ROSTER['opener'], 2, 0.0);
-  freshTarget2.takeHit(att, att.profile.moves.hp); // Heavy starter
+  freshTarget2.takeHit(att, att.profile.moves.hp);
   const dmgHeavy = freshTarget2.maxHealth - freshTarget2.health;
   assert(dmgLight === att.profile.moves.lp.damage, 'Light starter scales at 100%');
-  assert(dmgHeavy <= Math.round(att.profile.moves.hp.damage * 0.85), 'Heavy starter scales at 85%');
+  assert(dmgHeavy === att.profile.moves.hp.damage, 'Heavy starter also 100% on hit 1');
 }
 
 console.log('\n--- 22. Testing Meter Spend (Section 5.4) & Parry (Section 8) ---');

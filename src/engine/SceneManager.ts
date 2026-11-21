@@ -383,6 +383,15 @@ export class SceneManager {
     this.shakeTimer = duration;
   }
 
+  /** Brief FOV punch-in on heavy hits / launchers (~2–3°) */
+  public punchCamera(degrees: number = 2.5, recoverMs: number = 120): void {
+    this.camera.fov = Math.max(this.minFOV - 4, this.camera.fov - degrees);
+    this.camera.updateProjectionMatrix();
+    window.setTimeout(() => {
+      /* recover via updateCamera lerp toward targetFOV */
+    }, recoverMs);
+  }
+
   public render(): void {
     this.renderer.render(this.scene, this.camera);
   }

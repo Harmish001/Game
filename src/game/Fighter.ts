@@ -53,16 +53,37 @@ export class Fighter {
   private simFrameCount: number = 0;
   private lastLpSimFrame: number = -100;
   private lastLkSimFrame: number = -100;
-  private prevInputLp: boolean = false;
-  private prevInputLk: boolean = false;
+  /** Rising-edge trackers — attacks fire on press, not hold (FG standard) */
+  private prevBtns = {
+    lp: false,
+    hp: false,
+    lk: false,
+    hk: false,
+    special: false,
+    super: false,
+    block: false
+  };
+  /** One air normal per jump */
+  private airAttackUsed: boolean = false;
 
   // Combo tracking (damage scaling & juggles)
   public comboHitCount: number = 0;
+  public comboDamageTotal: number = 0;
   public comboTimer: number = 0;
   public juggleCount: number = 0;
   public wallBounceCount: number = 0;
   public wallBounceDamagePenalty: boolean = false;
   public comboStarterIsLight: boolean = false;
+  public lastCounterHit: boolean = false;
+
+  // Throw tech
+  public throwBreakTimer: number = 0;
+  private pendingThrowMove: MoveFrameData | null = null;
+  private pendingThrowAttacker: Fighter | null = null;
+
+  // Wake-up: 0=quick, 1=delayed, 2=roll
+  private getUpOption: 0 | 1 | 2 = 0;
+  private whooshArmed: boolean = false;
 
   // Projectile System
   public projectileSystem: any = null;
@@ -80,7 +101,8 @@ export class Fighter {
 
   /** Bumps when hit/block/knockdown applied — mesh restarts react clip */
   public animReactNonce: number = 0;
-  private prevInputBlock: boolean = false;
+  /** Holding back/block in neutral — mesh shows Defend */
+  public isGuarding: boolean = false;
 
   // Bounds
   private readonly stageMinX: number = -11.0;
@@ -117,10 +139,8 @@ export class Fighter {
     this.simFrameCount++;
 
     // Track button press frames for simultaneous press leniency (LP + LK throw)
-    if (input.lp && !this.prevInputLp) this.lastLpSimFrame = this.simFrameCount;
-    if (input.lk && !this.prevInputLk) this.lastLkSimFrame = this.simFrameCount;
-    this.prevInputLp = input.lp;
-    this.prevInputLk = input.lk;
+    if (this.pressed(input, 'lp')) this.lastLpSimFrame = this.simFrameCount;
+    if (this.pressed(input, 'lk')) this.lastLkSimFrame = this.simFrameCount;
 
     // Decay buffered attack
     if (this.bufferedAttack) {
@@ -146,6 +166,8 @@ export class Fighter {
       this.comboTimer -= dt;
       if (this.comboTimer <= 0) {
         this.comboHitCount = 0;
+        this.comboDamageTotal = 0;
+        this.lastCounterHit = false;
       }
     }
 
@@ -161,7 +183,7 @@ export class Fighter {
     }
 
     // Parry detection (tap block window) & block lock penalty
-    if (input.block && !this.prevInputBlock && this.blockLockTimer <= 0) {
+    if (this.pressed(input, 'block') && this.blockLockTimer <= 0) {
       this.parryTimer = 5;
     } else if (this.parryTimer > 0) {
       this.parryTimer--;
@@ -172,7 +194,16 @@ export class Fighter {
     if (this.blockLockTimer > 0) {
       this.blockLockTimer--;
     }
-    this.prevInputBlock = input.block;
+
+    // Guard pose: hold back or block in neutral (for mesh Defend clip)
+    const holdingAway = this.facingRight ? input.left : input.right;
+    this.isGuarding =
+      (holdingAway || input.block) &&
+      (this.state === 'IDLE' ||
+        this.state === 'WALK_BACK' ||
+        this.state === 'CROUCHING' ||
+        this.state === 'CROUCH_START' ||
+        this.state === 'BLOCK_STUN');
 
     // Burst / Combo Breaker (Break out of combo for 50% meter)
     const isBurstInput = (input.lp && input.lk && input.hp) || (input.block && input.special);
@@ -221,9 +252,30 @@ export class Fighter {
         this.y,
         moveDurationSec,
         stateDurationSec,
-        this.animReactNonce
+        this.animReactNonce,
+        this.isGuarding,
+        this.profile.walkSpeedFwd,
+        this.profile.walkSpeedBack,
+        this.profile.dashSpeed
       );
     }
+
+    // Latch buttons AFTER state logic so rising-edge is correct next frame
+    this.prevBtns.lp = input.lp;
+    this.prevBtns.hp = input.hp;
+    this.prevBtns.lk = input.lk;
+    this.prevBtns.hk = input.hk;
+    this.prevBtns.special = input.special;
+    this.prevBtns.super = input.super;
+    this.prevBtns.block = input.block;
+  }
+
+  /** True only on the frame a button goes from up → down */
+  private pressed(
+    input: RawPlayerInput,
+    btn: 'lp' | 'hp' | 'lk' | 'hk' | 'special' | 'super' | 'block'
+  ): boolean {
+    return !!input[btn] && !this.prevBtns[btn];
   }
 
   private applyPhysics(dt: number): void {
@@ -252,9 +304,10 @@ export class Fighter {
         this.wallBounceCount = 0;
         this.wallBounceDamagePenalty = false;
         if (this.state === 'JUMPING' || this.state === 'ATTACK') {
-          // Whiffed aerial attack landing penalty: 7 frames vs normal 3 frames
-          this.stateFramesTarget = this.hadAirAttack ? 7 : 3;
+          // Whiffed aerial attack landing penalty: 8 frames vs normal 4
+          this.stateFramesTarget = this.hadAirAttack ? 8 : 4;
           this.hadAirAttack = false;
+          this.airAttackUsed = false;
           this.changeState('JUMP_LAND');
         }
         // KNOCKDOWN stays KNOCKDOWN — handled by stateFrames timer in updateState
@@ -273,26 +326,43 @@ export class Fighter {
         break;
       }
 
-      case 'CROUCH_START':
+      case 'CROUCH_START': {
+        if (this.stateFrames >= 3) {
+          this.changeState('CROUCHING');
+        }
+        this.handleCrouchInputs(input, motion);
+        break;
+      }
+
       case 'CROUCHING': {
         this.handleCrouchInputs(input, motion);
         break;
       }
 
       case 'JUMP_START': {
-        if (this.stateFrames >= 4) {
+        // Pre-jump: lock airborne direction; launch after 3f startup
+        this.vx *= 0.92;
+        if (this.stateFrames >= 3) {
           this.changeState('JUMPING');
           this.vy = this.profile.jumpVelocityY;
+          this.airAttackUsed = false;
         }
         break;
       }
 
       case 'JUMPING': {
-        // Air attacks
-        if (input.hp && this.profile.moves.jump_hp) { this.tryExecuteMove(this.profile.moves.jump_hp); }
-        else if (input.lp && this.profile.moves.lp) { this.tryExecuteMove(this.profile.moves.lp); }
-        else if (input.lk && this.profile.moves.lk) { this.tryExecuteMove(this.profile.moves.lk); }
-        else if (input.hk && this.profile.moves.hk) { this.tryExecuteMove(this.profile.moves.hk); }
+        if (!this.airAttackUsed) {
+          const air =
+            (this.pressed(input, 'hp') && (this.profile.moves.jump_hp || this.profile.moves.hp)) ||
+            (this.pressed(input, 'lp') && (this.profile.moves.jump_lp || this.profile.moves.lp)) ||
+            (this.pressed(input, 'lk') && (this.profile.moves.jump_lk || this.profile.moves.lk)) ||
+            (this.pressed(input, 'hk') && (this.profile.moves.jump_hk || this.profile.moves.hk)) ||
+            null;
+          if (air) {
+            this.airAttackUsed = true;
+            this.tryExecuteMove(air);
+          }
+        }
         break;
       }
 
@@ -305,19 +375,27 @@ export class Fighter {
       }
 
       case 'DASH_FWD': {
-        this.vx = (this.facingRight ? 1 : -1) * this.profile.dashSpeed;
-        if (input.lp || input.hp || input.lk || input.hk) {
-          const move = (input.lp && this.profile.moves.lp) ||
-                       (input.hp && this.profile.moves.hp) ||
-                       (input.lk && this.profile.moves.lk) ||
-                       (input.hk && this.profile.moves.hk);
+        const dashLen = this.profile.dashFrames;
+        const cancelFrom = this.profile.dashCancelFrom ?? 10;
+        const t = Math.min(1, this.stateFrames / Math.max(1, dashLen));
+        const curve = 1 - t * t * 0.45;
+        this.vx = (this.facingRight ? 1 : -1) * this.profile.dashSpeed * curve;
+        this.isInvincible = false;
+        if (
+          this.stateFrames >= cancelFrom &&
+          (this.pressed(input, 'lp') ||
+            this.pressed(input, 'hp') ||
+            this.pressed(input, 'lk') ||
+            this.pressed(input, 'hk'))
+        ) {
+          const move = this.pickDirectionalNormal(input);
           if (move) {
-            this.runUpActive = (this.profile.id === 'quickie');
+            this.runUpActive = this.profile.id === 'quickie';
             this.tryExecuteMove(move);
             return;
           }
         }
-        if (this.stateFrames >= this.profile.dashFrames) {
+        if (this.stateFrames >= dashLen) {
           this.vx = 0;
           this.changeState('IDLE');
         }
@@ -325,9 +403,15 @@ export class Fighter {
       }
 
       case 'DASH_BACK': {
-        this.vx = (this.facingRight ? -1 : 1) * this.profile.dashSpeed * 0.85;
-        if (this.stateFrames >= this.profile.dashFrames) {
+        const bdLen = this.profile.backdashFrames ?? this.profile.dashFrames + 4;
+        const iFrames = this.profile.backdashInvulnFrames ?? 5;
+        const t = Math.min(1, this.stateFrames / Math.max(1, bdLen));
+        const curve = 1 - t * t * 0.35;
+        this.vx = (this.facingRight ? -1 : 1) * this.profile.dashSpeed * 0.82 * curve;
+        this.isInvincible = this.stateFrames > 0 && this.stateFrames <= iFrames;
+        if (this.stateFrames >= bdLen) {
           this.vx = 0;
+          this.isInvincible = false;
           this.changeState('IDLE');
         }
         break;
@@ -336,14 +420,23 @@ export class Fighter {
       case 'ATTACK': {
         if (this.currentMoveExecutor) {
           this.currentMoveExecutor.tick();
+          const mv = this.currentMoveExecutor.move;
 
-          // Spawn projectile on startup completion (active start)
+          // Reversal / DP invuln during early startup
+          if (mv.invincibleStartupFrames && this.currentMoveExecutor.isStartup()) {
+            this.isInvincible =
+              this.currentMoveExecutor.currentFrame <= mv.invincibleStartupFrames;
+          } else if (!mv.invincibleStartupFrames && this.state === 'ATTACK') {
+            // clear only if we set it for this move
+          }
+
+          const spawnAt = mv.projectileSpawnFrame ?? mv.startup;
           if (
-            this.currentMoveExecutor.currentFrame === this.currentMoveExecutor.move.startup &&
-            this.currentMoveExecutor.move.projectileDef &&
+            this.currentMoveExecutor.currentFrame === spawnAt &&
+            mv.projectileDef &&
             this.projectileSystem
           ) {
-            this.projectileSystem.spawn(this, this.currentMoveExecutor.move.projectileDef);
+            this.projectileSystem.spawn(this, mv.projectileDef);
           }
 
           // Ashwin Googly: startup feint cancel (costs 10% meter)
@@ -354,18 +447,18 @@ export class Fighter {
             input
           ) {
             const m = this.currentMoveExecutor.move;
-            const isPunch = m.input.includes('Punch') || m.id.includes('p');
-            const isKick = m.input.includes('Kick') || m.id.includes('k');
+            const isPunch = m.input.includes('P') || m.id.includes('_lp') || m.id.includes('_hp') || m.id.includes('special_1') || m.id.includes('special_3');
+            const isKick = m.input.includes('K') || m.id.includes('_lk') || m.id.includes('_hk') || m.id.includes('special_2');
             if ((isPunch && (input.lk || input.hk)) || (isKick && (input.lp || input.hp))) {
               this.meter -= 10;
               this.currentMoveExecutor = null;
+              this.isInvincible = false;
               this.stateFramesTarget = 4;
               this.changeState('IDLE');
               return;
             }
           }
 
-          // Check cancel into special or super
           if (this.currentMoveExecutor.hasHit) {
             this.handleAttackCancels(input, motion);
           } else {
@@ -374,12 +467,12 @@ export class Fighter {
 
           if (this.currentMoveExecutor && this.currentMoveExecutor.isFinished()) {
             this.runUpActive = false;
+            this.isInvincible = false;
             const finishedMove = this.currentMoveExecutor.move;
             const hadHit = this.currentMoveExecutor.hasHit;
             this.currentMoveExecutor = null;
 
             if (finishedMove.hitLevel === 'throw' && !hadHit) {
-              // Whiffed throw gets 20 frames of punishable whiff recovery
               this.stateFramesTarget = 20;
               this.changeState('THROW_WHIFF');
               return;
@@ -395,6 +488,34 @@ export class Fighter {
           }
         } else {
           this.changeState('IDLE');
+        }
+        break;
+      }
+
+      case 'THROW_START': {
+        this.vx = 0;
+        // Wait for defender tech resolution / throw resolve
+        if (this.stateFrames >= 40) {
+          this.changeState('IDLE');
+        }
+        break;
+      }
+
+      case 'BEING_THROWN': {
+        this.vx = 0;
+        this.throwBreakTimer--;
+        const tech =
+          this.pressed(input, 'lp') ||
+          this.pressed(input, 'hp') ||
+          this.pressed(input, 'lk') ||
+          this.pressed(input, 'hk');
+        if (tech && this.throwBreakTimer > 0) {
+          this.resolveThrowTech();
+          return;
+        }
+        if (this.throwBreakTimer <= 0) {
+          this.resolveThrowConnect();
+          return;
         }
         break;
       }
@@ -452,19 +573,31 @@ export class Fighter {
       case 'KNOCKDOWN': {
         this.vx *= 0.85;
         this.isInvincible = true;
-        // Only get up if still alive; stay down if KO
-        if (this.health > 0 && this.stateFrames >= 36) {
+        // Wake-up option select while down
+        if (this.pressed(input, 'lk') || this.pressed(input, 'lp')) this.getUpOption = 0; // quick
+        if (this.pressed(input, 'hk') || this.pressed(input, 'hp')) this.getUpOption = 1; // delayed
+        if (input.left || input.right) this.getUpOption = 2; // roll
+        const kdWait = this.getUpOption === 1 ? 48 : this.getUpOption === 2 ? 30 : 36;
+        if (this.health > 0 && this.stateFrames >= kdWait) {
           this.changeState('GET_UP');
         }
         break;
       }
 
       case 'GET_UP': {
-        // Invulnerable for frames 0-13, vulnerable for frames 14-20 (meaty / okizeme window)
-        this.isInvincible = this.stateFrames < 14;
+        // quick: short invuln; delayed: longer invuln; roll: invuln + slide
+        const invuln =
+          this.getUpOption === 1 ? 18 : this.getUpOption === 2 ? 16 : 12;
+        const total = this.getUpOption === 1 ? 26 : this.getUpOption === 2 ? 22 : 18;
+        this.isInvincible = this.stateFrames < invuln;
+        if (this.getUpOption === 2 && this.stateFrames < 10) {
+          this.vx = (this.facingRight ? -1 : 1) * 2.4;
+        }
         this.bufferAttack(input, motion);
-        if (this.stateFrames >= 20) {
+        if (this.stateFrames >= total) {
           this.isInvincible = false;
+          this.vx = 0;
+          this.getUpOption = 0;
           this.changeState('IDLE');
         }
         break;
@@ -485,10 +618,10 @@ export class Fighter {
     }
   }
 
-  private stateFramesTarget: number = 0;
+  public stateFramesTarget: number = 0;
 
   private handleNeutralInputs(input: RawPlayerInput, motion: MotionCommand): void {
-    // 0. Rohit Power Hit Charge (Finisher: hold heavy attack button in neutral)
+    // 0. Rohit Power Hit Charge (Finisher: hold heavy in neutral, release to fire)
     if (this.profile.id === 'finisher') {
       if (input.hp || input.hk) {
         this.chargeFrames = Math.min(40, this.chargeFrames + 1);
@@ -512,15 +645,27 @@ export class Fighter {
       }
     }
 
-    // 1. Super Move (Full Meter)
-    if (input.super && this.meter >= 100 && this.profile.moves.super) {
+    const atk =
+      this.pressed(input, 'lp') ||
+      this.pressed(input, 'hp') ||
+      this.pressed(input, 'lk') ||
+      this.pressed(input, 'hk') ||
+      this.pressed(input, 'special') ||
+      this.pressed(input, 'super');
+
+    // 1. Super (press)
+    if (this.pressed(input, 'super') && this.meter >= 100 && this.profile.moves.super) {
       this.executeSuper();
       return;
     }
 
-    // EX Specials (33% meter, simultaneous double-punch or double-kick)
-    const isExMotion = (input.lp && input.hp) || (input.lk && input.hk);
-    if (this.meter >= 33 && isExMotion) {
+    // EX Specials — both heavies pressed same frame + motion
+    const isExMotion =
+      (this.pressed(input, 'lp') && input.hp) ||
+      (this.pressed(input, 'hp') && input.lp) ||
+      (this.pressed(input, 'lk') && input.hk) ||
+      (this.pressed(input, 'hk') && input.lk);
+    if (atk && this.meter >= 33 && isExMotion) {
       if (motion === 'QCF' && this.profile.moves.special_1) {
         this.meter -= 33;
         this.tryExecuteMove(this.profile.moves.special_1, true);
@@ -538,55 +683,46 @@ export class Fighter {
       }
     }
 
-    // 2. Motion Specials
-    if (motion === 'QCF' && (input.lp || input.hp) && this.profile.moves.special_1) {
+    // 2. Motion Specials (button must be pressed this frame)
+    if (motion === 'QCF' && (this.pressed(input, 'lp') || this.pressed(input, 'hp')) && this.profile.moves.special_1) {
       this.tryExecuteMove(this.profile.moves.special_1);
       return;
     }
-    if (motion === 'QCB' && (input.lk || input.hk) && this.profile.moves.special_2) {
+    if (motion === 'QCB' && (this.pressed(input, 'lk') || this.pressed(input, 'hk')) && this.profile.moves.special_2) {
       this.tryExecuteMove(this.profile.moves.special_2);
       return;
     }
-    if (motion === 'DP_FWD' && (input.lk || input.hk) && this.profile.moves.special_3) {
+    if (motion === 'DP_FWD' && (this.pressed(input, 'lk') || this.pressed(input, 'hk')) && this.profile.moves.special_3) {
       this.tryExecuteMove(this.profile.moves.special_3);
       return;
     }
 
-    // 3. Mobile / Simple Special button
-    if (input.special && this.profile.moves.special_1) {
+    // 3. Special button
+    if (this.pressed(input, 'special') && this.profile.moves.special_1) {
       this.tryExecuteMove(this.profile.moves.special_1);
       return;
     }
 
-    // 4. Throw / Grab (LP + LK or simultaneous press within 3 frames)
+    // 4. Throw — LP+LK same frame or within 3f window, at least one rising edge
+    const throwEdge = this.pressed(input, 'lp') || this.pressed(input, 'lk');
     const isSimultaneousThrow =
-      (input.lp && input.lk) ||
-      (Math.abs(this.lastLpSimFrame - this.lastLkSimFrame) <= 3 && (input.lp || input.lk));
+      throwEdge &&
+      ((input.lp && input.lk) ||
+        Math.abs(this.lastLpSimFrame - this.lastLkSimFrame) <= 3);
 
     if (isSimultaneousThrow && this.profile.moves.throw) {
       this.tryExecuteMove(this.profile.moves.throw);
       return;
     }
 
-    // 5. Normal Attacks
-    if (input.lp && this.profile.moves.lp) {
-      this.tryExecuteMove(this.profile.moves.lp);
-      return;
-    }
-    if (input.hp && this.profile.moves.hp) {
-      this.tryExecuteMove(this.profile.moves.hp);
-      return;
-    }
-    if (input.lk && this.profile.moves.lk) {
-      this.tryExecuteMove(this.profile.moves.lk);
-      return;
-    }
-    if (input.hk && this.profile.moves.hk) {
-      this.tryExecuteMove(this.profile.moves.hk);
+    // 5. Normals — directional variants first (overhead / AA / far poke / heavy launch)
+    const dirMove = this.pickDirectionalNormal(input);
+    if (dirMove) {
+      this.tryExecuteMove(dirMove);
       return;
     }
 
-    // 6. Dash double taps
+    // 6. Dash (double-tap)
     if (motion === 'DASH_FWD') {
       this.changeState('DASH_FWD');
       return;
@@ -596,38 +732,47 @@ export class Fighter {
       return;
     }
 
-    // 7. Jump
+    // 7. Jump — commit hop direction at start
     if (input.up) {
       const isFwd = this.facingRight ? input.right : input.left;
       const isBack = this.facingRight ? input.left : input.right;
-      this.vx = isFwd ? (this.facingRight ? 1 : -1) * 2.8 : isBack ? (this.facingRight ? -1 : 1) * 2.4 : 0;
+      const hop = this.profile.jumpVelocityY * 0.38;
+      this.vx = isFwd
+        ? (this.facingRight ? 1 : -1) * hop
+        : isBack
+          ? (this.facingRight ? -1 : 1) * hop * 0.85
+          : 0;
+      this.airAttackUsed = false;
       this.changeState('JUMP_START');
       return;
     }
 
-    // 8. Crouch
+    // 8. Crouch — startup then hold
     if (input.down) {
       this.vx = 0;
-      this.changeState('CROUCHING');
+      if (this.state !== 'CROUCH_START' && this.state !== 'CROUCHING') {
+        this.changeState('CROUCH_START');
+      }
       return;
     }
 
-    // 9. Walk Forward / Backward (Chase Mode grants +10% forward walk speed)
+    // 9. Walk
     const wantsRight = input.right;
     const wantsLeft = input.left;
     const fwdSpeed = this.profile.walkSpeedFwd * (this.chaseModeTimer > 0 ? 1.1 : 1.0);
+    const backSpeed = this.profile.walkSpeedBack;
 
     if (wantsRight && !wantsLeft) {
       if (this.facingRight) {
         this.vx = fwdSpeed;
         this.changeState('WALK_FWD');
       } else {
-        this.vx = this.profile.walkSpeedBack;
+        this.vx = backSpeed;
         this.changeState('WALK_BACK');
       }
     } else if (wantsLeft && !wantsRight) {
       if (this.facingRight) {
-        this.vx = -this.profile.walkSpeedBack;
+        this.vx = -backSpeed;
         this.changeState('WALK_BACK');
       } else {
         this.vx = -fwdSpeed;
@@ -645,80 +790,189 @@ export class Fighter {
       return;
     }
 
-    // Crouch attacks
-    if (input.lp && this.profile.moves.crouch_lp) {
-      this.tryExecuteMove(this.profile.moves.crouch_lp);
+    this.vx = 0;
+
+    if (this.pressed(input, 'super') && this.meter >= 100 && this.profile.moves.super) {
+      this.executeSuper();
       return;
     }
-    if (input.hp && this.profile.moves.crouch_lp) {
-      this.tryExecuteMove(this.profile.moves.crouch_lp);
-      return;
-    }
-    if (input.lk && this.profile.moves.crouch_hk) {
-      this.tryExecuteMove(this.profile.moves.crouch_hk);
-      return;
-    }
-    if (input.hk && this.profile.moves.crouch_hk) {
-      this.tryExecuteMove(this.profile.moves.crouch_hk);
-      return;
-    }
-    if (input.special && this.profile.moves.special_3) {
+    if (motion === 'DP_FWD' && this.profile.moves.special_3) {
       this.tryExecuteMove(this.profile.moves.special_3);
       return;
     }
-    if (motion === 'QCF' && input.lp && this.profile.moves.special_1) {
+    if (motion === 'QCF' && this.profile.moves.special_1) {
       this.tryExecuteMove(this.profile.moves.special_1);
+      return;
+    }
+    if (this.pressed(input, 'lp') && this.profile.moves.crouch_lp) {
+      this.tryExecuteMove(this.profile.moves.crouch_lp);
+      return;
+    }
+    if (this.pressed(input, 'hp') && (this.profile.moves.crouch_hp || this.profile.moves.crouch_lp)) {
+      this.tryExecuteMove(this.profile.moves.crouch_hp || this.profile.moves.crouch_lp);
+      return;
+    }
+    if (this.pressed(input, 'lk') && (this.profile.moves.crouch_lk || this.profile.moves.crouch_hk)) {
+      this.tryExecuteMove(this.profile.moves.crouch_lk || this.profile.moves.crouch_hk);
+      return;
+    }
+    if (this.pressed(input, 'hk') && this.profile.moves.crouch_hk) {
+      this.tryExecuteMove(this.profile.moves.crouch_hk);
+      return;
+    }
+    if (this.pressed(input, 'special') && this.profile.moves.special_3) {
+      this.tryExecuteMove(this.profile.moves.special_3);
       return;
     }
   }
 
+  /** Forward/back + button → overhead / AA / far poke / heavy launcher */
+  private pickDirectionalNormal(input: RawPlayerInput): MoveFrameData | null {
+    const fwd = this.facingRight ? input.right : input.left;
+    const back = this.facingRight ? input.left : input.right;
+    const m = this.profile.moves;
+
+    if (this.pressed(input, 'hp')) {
+      if (fwd && m.overhead) return m.overhead;
+      if (back && m.anti_air) return m.anti_air;
+      if (m.hp) return m.hp;
+    }
+    if (this.pressed(input, 'hk')) {
+      if (fwd && m.heavy_launcher) return m.heavy_launcher;
+      if (m.hk) return m.hk;
+    }
+    if (this.pressed(input, 'lp')) {
+      if (fwd && m.far_hp) return m.far_hp;
+      if (m.lp) return m.lp;
+    }
+    if (this.pressed(input, 'lk')) {
+      if (fwd && m.approach) return m.approach;
+      if (m.lk) return m.lk;
+    }
+    return null;
+  }
+
   private handleAttackCancels(input: RawPlayerInput, motion: MotionCommand): void {
     if (!this.currentMoveExecutor) return;
+    const ex = this.currentMoveExecutor;
 
-    // Super cancel
-    if (input.super && this.meter >= 100 && this.currentMoveExecutor.canCancelInto('super')) {
+    if (this.pressed(input, 'super') && this.meter >= 100 && ex.canCancelInto('super')) {
       this.executeSuper();
       return;
     }
-
-    // Special cancels
-    if ((motion === 'QCF' || input.special) && this.currentMoveExecutor.canCancelInto('special_1')) {
+    if ((motion === 'QCF' || this.pressed(input, 'special')) && ex.canCancelInto('special_1')) {
       this.tryExecuteMove(this.profile.moves.special_1);
       return;
     }
-    if (motion === 'QCB' && this.currentMoveExecutor.canCancelInto('special_2')) {
+    if (motion === 'QCB' && ex.canCancelInto('special_2')) {
       this.tryExecuteMove(this.profile.moves.special_2);
       return;
     }
-    if (input.hp && this.currentMoveExecutor.canCancelInto('hp')) {
-      this.tryExecuteMove(this.profile.moves.hp);
+    if (motion === 'DP_FWD' && ex.canCancelInto('special_3')) {
+      this.tryExecuteMove(this.profile.moves.special_3);
       return;
     }
-    if (input.hk && this.currentMoveExecutor.canCancelInto('hk')) {
-      this.tryExecuteMove(this.profile.moves.hk);
-      return;
+    // Gatling normals
+    const gatling: Array<[keyof RawPlayerInput, string]> = [
+      ['lp', 'lp_follow'],
+      ['lp', 'lp'],
+      ['hp', 'hp'],
+      ['lk', 'lk'],
+      ['hk', 'hk'],
+      ['hp', 'crouch_hp']
+    ];
+    for (const [btn, key] of gatling) {
+      if (this.pressed(input, btn as 'lp' | 'hp' | 'lk' | 'hk') && ex.canCancelInto(key) && this.profile.moves[key]) {
+        this.tryExecuteMove(this.profile.moves[key]);
+        return;
+      }
     }
   }
 
   public tryExecuteMove(move: MoveFrameData, isEx: boolean = false): boolean {
     if (!move) return false;
     this.currentMoveExecutor = new MoveExecutor(move);
+    this.whooshArmed = true;
     if (this.state === 'DASH_FWD') {
-      this.runUpActive = (this.profile.id === 'quickie');
+      this.runUpActive = this.profile.id === 'quickie';
     }
-    // Ground attacks stop horizontal movement; air attacks preserve aerial momentum
     if (this.y <= 0) {
       this.vx = 0;
     } else {
       this.hadAirAttack = true;
     }
     this.isArmored = !!move.isArmored || isEx;
-    this.armorHitsLeft = (move.isArmored || isEx) ? 1 : 0;
+    this.armorHitsLeft = move.isArmored || isEx ? 1 : 0;
+    if (move.invincibleStartupFrames) {
+      this.isInvincible = true;
+    }
     if (isEx) {
       this.currentMoveExecutor.currentFrame = Math.min(2, move.startup - 1);
     }
     this.changeState('ATTACK');
     return true;
+  }
+
+  /** True on the frame strike becomes active — main plays whoosh */
+  public consumeWhoosh(): boolean {
+    if (!this.currentMoveExecutor?.isActive()) return false;
+    if (!this.whooshArmed) return false;
+    // whooshArmed cleared in ATTACK tick; arm a one-shot via flag flip
+    return true;
+  }
+
+  public needsWhoosh(): boolean {
+    return (
+      !!this.currentMoveExecutor &&
+      this.whooshArmed &&
+      this.currentMoveExecutor.currentFrame === this.currentMoveExecutor.move.startup
+    );
+  }
+
+  public markWhooshPlayed(): void {
+    this.whooshArmed = false;
+  }
+
+  private resolveThrowTech(): void {
+    const atk = this.pendingThrowAttacker;
+    this.throwBreakTimer = 0;
+    this.pendingThrowMove = null;
+    this.pendingThrowAttacker = null;
+    this.stateFramesTarget = 10; // defender +2-ish advantage vs attacker
+    this.changeState('THROW_TECH');
+    this.vx = (this.facingRight ? -1 : 1) * 2.2;
+    if (atk) {
+      atk.currentMoveExecutor = null;
+      atk.stateFramesTarget = 14;
+      atk.changeState('THROW_TECH');
+      atk.vx = (atk.facingRight ? -1 : 1) * 2.2;
+    }
+  }
+
+  private resolveThrowConnect(): void {
+    const move = this.pendingThrowMove;
+    const atk = this.pendingThrowAttacker;
+    this.throwBreakTimer = 0;
+    this.pendingThrowMove = null;
+    this.pendingThrowAttacker = null;
+    if (!move || !atk) {
+      this.changeState('IDLE');
+      return;
+    }
+    const dmg = move.damage;
+    this.health = Math.max(0, this.health - dmg);
+    this.comboHitCount = 1;
+    this.comboDamageTotal = dmg;
+    this.comboTimer = 1.6;
+    this.addMeter(move.meterGain * 0.5);
+    atk.addMeter(move.meterGain);
+    const dir = atk.facingRight ? 1 : -1;
+    this.vx = dir * move.knockback.x;
+    this.vy = move.knockback.y;
+    this.animReactNonce++;
+    this.changeState('KNOCKDOWN');
+    atk.currentMoveExecutor = null;
+    atk.changeState('IDLE');
   }
 
   private executeSuper(): void {
@@ -729,38 +983,47 @@ export class Fighter {
   }
 
   private bufferAttack(input: RawPlayerInput, motion: MotionCommand): void {
-    if (input.super && this.meter >= 100 && this.profile.moves.super) {
-      this.bufferedAttack = { moveKey: 'super', framesLeft: 5 };
+    const BUF = 6; // forgiving pre-actionable buffer (guide 4–6f)
+    if (this.pressed(input, 'super') && this.meter >= 100 && this.profile.moves.super) {
+      this.bufferedAttack = { moveKey: 'super', framesLeft: BUF };
       return;
     }
-    if ((motion === 'DP_FWD' || input.special) && this.profile.moves.special_3) {
-      this.bufferedAttack = { moveKey: 'special_3', framesLeft: 5 };
+    if (motion === 'DP_FWD' && this.profile.moves.special_3) {
+      this.bufferedAttack = { moveKey: 'special_3', framesLeft: BUF };
       return;
     }
-    if ((motion === 'QCF' || input.special) && this.profile.moves.special_1) {
-      this.bufferedAttack = { moveKey: 'special_1', framesLeft: 5 };
+    if ((motion === 'QCF' || this.pressed(input, 'special')) && this.profile.moves.special_1) {
+      this.bufferedAttack = { moveKey: 'special_1', framesLeft: BUF };
       return;
     }
     if (motion === 'QCB' && this.profile.moves.special_2) {
-      this.bufferedAttack = { moveKey: 'special_2', framesLeft: 5 };
+      this.bufferedAttack = { moveKey: 'special_2', framesLeft: BUF };
       return;
     }
-    const isSimultaneousThrow =
-      (input.lp && input.lk) ||
-      (Math.abs(this.lastLpSimFrame - this.lastLkSimFrame) <= 3 && (input.lp || input.lk));
-    if (isSimultaneousThrow && this.profile.moves.throw) {
-      this.bufferedAttack = { moveKey: 'throw', framesLeft: 5 };
+    const throwEdge = this.pressed(input, 'lp') || this.pressed(input, 'lk');
+    if (throwEdge && input.lp && input.lk && this.profile.moves.throw) {
+      this.bufferedAttack = { moveKey: 'throw', framesLeft: BUF };
       return;
     }
     const isCrouch = !!input.down;
-    if (input.hp) {
-      this.bufferedAttack = { moveKey: isCrouch ? 'crouch_lp' : 'hp', framesLeft: 5 };
-    } else if (input.hk) {
-      this.bufferedAttack = { moveKey: isCrouch ? 'crouch_hk' : 'hk', framesLeft: 5 };
-    } else if (input.lp) {
-      this.bufferedAttack = { moveKey: isCrouch ? 'crouch_lp' : 'lp', framesLeft: 5 };
-    } else if (input.lk) {
-      this.bufferedAttack = { moveKey: isCrouch ? 'crouch_hk' : 'lk', framesLeft: 5 };
+    const fwd = this.facingRight ? input.right : input.left;
+    const back = this.facingRight ? input.left : input.right;
+    if (this.pressed(input, 'hp')) {
+      let key = isCrouch ? 'crouch_hp' : fwd ? 'overhead' : back ? 'anti_air' : 'hp';
+      if (!this.profile.moves[key]) key = isCrouch ? 'crouch_lp' : 'hp';
+      this.bufferedAttack = { moveKey: key, framesLeft: BUF };
+    } else if (this.pressed(input, 'hk')) {
+      let key = isCrouch ? 'crouch_hk' : fwd ? 'heavy_launcher' : 'hk';
+      if (!this.profile.moves[key]) key = 'hk';
+      this.bufferedAttack = { moveKey: key, framesLeft: BUF };
+    } else if (this.pressed(input, 'lp')) {
+      let key = isCrouch ? 'crouch_lp' : fwd ? 'far_hp' : 'lp';
+      if (!this.profile.moves[key]) key = 'lp';
+      this.bufferedAttack = { moveKey: key, framesLeft: BUF };
+    } else if (this.pressed(input, 'lk')) {
+      let key = isCrouch ? 'crouch_lk' : 'lk';
+      if (!this.profile.moves[key]) key = isCrouch ? 'crouch_hk' : 'lk';
+      this.bufferedAttack = { moveKey: key, framesLeft: BUF };
     }
   }
 
@@ -779,15 +1042,22 @@ export class Fighter {
   }
 
   public changeState(newState: FighterState): void {
+    // Same-state no-op (except ATTACK→ATTACK cancel). Stops per-frame timer reset.
+    if (this.state === newState && newState !== 'ATTACK') {
+      return;
+    }
+
     if (this.state === 'ATTACK' && newState !== 'ATTACK') {
       this.currentMoveExecutor = null;
+    }
+    if (this.state === 'DASH_BACK' && newState !== 'DASH_BACK') {
+      this.isInvincible = false;
     }
     this.state = newState;
     this.stateTimer = 0;
     this.stateFrames = 0;
 
-    // Check buffered attack on entering neutral state
-    if (newState === 'IDLE' || newState === 'CROUCHING') {
+    if (newState === 'IDLE' || newState === 'CROUCHING' || newState === 'CROUCH_START') {
       this.consumeBufferedAttack();
     }
   }
@@ -870,16 +1140,29 @@ export class Fighter {
       };
     }
 
-    // 3. Counter Hit Check (was victim in attack startup?)
+    // 3. Counter Hit — startup OR recovery (whiff punish) OR throw whiff
     const isCounter =
+      this.state === 'THROW_WHIFF' ||
+      (this.state === 'ATTACK' &&
+        this.currentMoveExecutor !== null &&
+        (this.currentMoveExecutor.isStartup() || this.currentMoveExecutor.isRecovery()));
+
+    // Strike beats throw startup → CH cancel throw
+    if (
+      !isThrow &&
       this.state === 'ATTACK' &&
-      this.currentMoveExecutor !== null &&
-      this.currentMoveExecutor.isStartup();
+      this.currentMoveExecutor?.move.hitLevel === 'throw' &&
+      this.currentMoveExecutor.isStartup()
+    ) {
+      this.currentMoveExecutor = null;
+    }
 
     // 4. Blocking & Parry Check
     const attackerIsOnRight = attacker.x > this.x;
     const isHoldingAway = this.currentInput
-      ? (attackerIsOnRight ? this.currentInput.left : this.currentInput.right)
+      ? attackerIsOnRight
+        ? this.currentInput.left
+        : this.currentInput.right
       : false;
     const isPressingBlock = this.currentInput ? !!this.currentInput.block : false;
     const canBlockState =
@@ -889,8 +1172,11 @@ export class Fighter {
       this.state === 'CROUCH_START' ||
       this.state === 'BLOCK_STUN';
 
-    // Parry (Section 8: tap block within 5 frames, 0 blockstun, +2 frame adv, +5% meter, opponent -5% meter)
-    const canParry = this.parryTimer > 0 && !isThrow && move.hitLevel !== 'unblockable' && move.id !== 'super';
+    const canParry =
+      this.parryTimer > 0 &&
+      !isThrow &&
+      move.hitLevel !== 'unblockable' &&
+      move.id !== 'super';
     if (canParry && canBlockState) {
       this.parryTimer = 0;
       this.addMeter(5);
@@ -918,19 +1204,26 @@ export class Fighter {
     let isBlocked = false;
     if (isDefending && !isThrow && move.hitLevel !== 'unblockable') {
       const isCrouching = this.state === 'CROUCHING' || this.state === 'CROUCH_START';
-
       if (move.hitLevel === 'high') {
-        isBlocked = !isCrouching;
+        isBlocked = !isCrouching; // crouch under highs
       } else if (move.hitLevel === 'mid') {
         isBlocked = true;
       } else if (move.hitLevel === 'low') {
         isBlocked = isCrouching;
+      } else if (move.hitLevel === 'overhead' || move.isOverhead) {
+        isBlocked = !isCrouching; // must stand-block
       }
     }
 
-    // Throws: Beat block, but cannot connect on airborne targets or targets in hitstun/knockdown/getup!
+    // Throws: beat block; open tech window (no instant damage)
     if (isThrow) {
-      if (this.y > 0 || this.state === 'HIT_STUN' || this.state === 'KNOCKDOWN' || this.state === 'GET_UP') {
+      if (
+        this.y > 0 ||
+        this.state === 'HIT_STUN' ||
+        this.state === 'KNOCKDOWN' ||
+        this.state === 'GET_UP' ||
+        this.state === 'BEING_THROWN'
+      ) {
         return {
           hit: false,
           blocked: false,
@@ -942,7 +1235,23 @@ export class Fighter {
           isKnockdown: false
         };
       }
-      isBlocked = false;
+      this.pendingThrowMove = move;
+      this.pendingThrowAttacker = attacker;
+      this.throwBreakTimer = move.throwBreakWindow ?? 16;
+      this.animReactNonce++;
+      this.changeState('BEING_THROWN');
+      attacker.currentMoveExecutor = null;
+      attacker.changeState('THROW_START');
+      return {
+        hit: true,
+        blocked: false,
+        counterHit: false,
+        damage: 0,
+        hitstop: 6,
+        knockback: { x: 0, y: 0 },
+        isLauncher: false,
+        isKnockdown: false
+      };
     }
 
     // 5. Calculate Damage with Combo Scaling & Guard Gauge
@@ -973,24 +1282,31 @@ export class Fighter {
       }
 
       finalDamage = move.chipDamage || 0;
-      this.health = Math.max(1, this.health - finalDamage); // Chip cannot kill in v1
-      this.stateFramesTarget = Math.max(6, 12 - move.onBlockFrameAdvantage);
+      this.health = Math.max(1, this.health - finalDamage);
+      // Blockstun from onBlockFrameAdvantage: more minus = more stun for defender? 
+      // Advantage is attacker-relative: -10 means defender is +10 → longer blockstun.
+      this.stateFramesTarget = Math.max(6, 10 - move.onBlockFrameAdvantage);
       this.animReactNonce++;
       this.changeState('BLOCK_STUN');
 
       const dir = this.facingRight ? -1 : 1;
-      this.vx = dir * 2.2;
+      const push = move.pushbackOnBlock ?? (move.damage >= 14 ? 1.6 : 0.7);
+      this.vx = dir * (1.4 + push);
 
       this.addMeter(move.meterGain * 0.05);
-      attacker.addMeter(move.meterGain * 0.50);
+      attacker.addMeter(move.meterGain * 0.5);
+
+      // Hitstop by strength on block (light 3 / med 5 / heavy 7)
+      const blockStop =
+        move.hitstop >= 12 ? 7 : move.hitstop >= 8 ? 5 : 3;
 
       return {
         hit: false,
         blocked: true,
         counterHit: false,
         damage: finalDamage,
-        hitstop: 5,
-        knockback: { x: dir * 1.5, y: 0 },
+        hitstop: blockStop,
+        knockback: { x: dir * push, y: 0 },
         isLauncher: false,
         isKnockdown: false
       };
@@ -1000,31 +1316,29 @@ export class Fighter {
     attacker.hadAirAttack = false;
     if (this.comboHitCount === 0) {
       this.comboStarterIsLight = move.hitLevel === 'high' || move.damage <= 7;
+      this.comboDamageTotal = 0;
     }
     this.comboHitCount++;
     this.comboTimer = 1.6;
+    this.lastCounterHit = isCounter;
 
-    // Combo damage scaling
-    let damageScale = 1.0;
-    if (this.comboHitCount === 2) damageScale = 0.85;
-    else if (this.comboHitCount === 3) damageScale = 0.75;
-    else if (this.comboHitCount >= 4) damageScale = 0.60;
+    // Guide scaling: 100 / 90 / 80 / 70 / 60 then floor 40%
+    const scaleTable = [1, 0.9, 0.8, 0.7, 0.6];
+    let damageScale =
+      this.comboHitCount <= 5 ? scaleTable[this.comboHitCount - 1] : 0.4;
 
-    // Starter scaling: heavy starters get scaled to 85%
-    if (!this.comboStarterIsLight) damageScale *= 0.85;
-
-    // Wall bounce scaling penalty (50% cap on next hit)
     if (this.wallBounceDamagePenalty) {
-      damageScale = Math.min(damageScale, 0.50);
+      damageScale = Math.min(damageScale, 0.5);
     }
 
     if (isCounter) {
-      damageScale *= 1.25; // 25% Counter Hit Bonus!
+      damageScale *= 1.35;
     }
 
     const minDamage = Math.max(1, Math.floor(move.damage * 0.15));
     finalDamage = Math.max(minDamage, Math.round(move.damage * damageScale));
     this.health = Math.max(0, this.health - finalDamage);
+    this.comboDamageTotal += finalDamage;
 
     // Virat Chase Mode stacks (opener gains stack on clean hit, loses all when hit)
     if (attacker.profile.id === 'opener') {
@@ -1042,19 +1356,21 @@ export class Fighter {
     this.addMeter(move.meterGain * 0.6);
     attacker.addMeter(move.meterGain);
 
-    // Knockback
+    // Knockback + pushback
     const dir = attacker.facingRight ? 1 : -1;
-    const kbX = dir * move.knockback.x;
+    const pushHit = move.pushbackOnHit ?? move.knockback.x;
+    const kbX = dir * Math.max(move.knockback.x, pushHit * 0.85);
     const kbY = move.knockback.y;
-
-    this.vx = kbX;
+    // Corner: less attacker push-away (attacker sticks closer)
+    const nearCorner = Math.abs(this.x) >= 9.5;
+    this.vx = kbX * (nearCorner ? 0.65 : 1);
     this.vy = kbY;
 
-    // Wall bounce check: within 1.5 of stage bounds (±11.0 -> |x| >= 9.5)
+    // One wall splat per combo
     let triggeredWallBounce = false;
     if (
       (move.isLauncher || Math.abs(move.knockback.x) >= 3.0) &&
-      Math.abs(this.x) >= 9.5 &&
+      nearCorner &&
       this.wallBounceCount === 0
     ) {
       this.wallBounceCount = 1;
@@ -1063,39 +1379,39 @@ export class Fighter {
       const bounceDir = this.x > 0 ? -1 : 1;
       this.vx = bounceDir * 3.5;
       this.vy = 4.2;
+      this.animReactNonce++;
       this.changeState('JUMPING');
     }
 
     if (!triggeredWallBounce) {
-      // Launch or knockdown or hitstun with juggle limits
       if (this.y > 0) {
         this.juggleCount++;
-        if (this.juggleCount >= 3) {
-          // Juggle limit reached: force hard knockdown
+        // Juggle decay: faster fall each hit; drop after 5–6
+        if (this.juggleCount >= 5) {
           this.animReactNonce++;
           this.changeState('KNOCKDOWN');
-          this.vy = -1.0;
+          this.vy = -1.2;
         } else {
           this.animReactNonce++;
           this.changeState('JUMPING');
-          this.vy = Math.max(2.5, kbY);
+          const decay = 1 - this.juggleCount * 0.12;
+          this.vy = Math.max(1.6, kbY * decay);
         }
       } else if (move.isLauncher) {
         this.juggleCount = 0;
-        this.vy = Math.max(4.5, kbY * 1.5);
+        this.vy = Math.max(4.2, kbY * 1.45);
         this.animReactNonce++;
         this.changeState('JUMPING');
       } else if (move.isHardKnockdown || this.health <= 0) {
-        if (this.y <= 0) {
-          this.vy = Math.max(0.6, kbY);
-        }
+        if (this.y <= 0) this.vy = Math.max(0.6, kbY);
         this.animReactNonce++;
         this.changeState('KNOCKDOWN');
       } else {
         const chaseBonus = attacker.chaseModeTimer > 0 ? 1 : 0;
+        const chBonus = isCounter ? 5 : 0;
         this.stateFramesTarget = Math.max(
           10,
-          14 + move.onHitFrameAdvantage + chaseBonus + (isCounter ? 4 : 0)
+          12 + move.onHitFrameAdvantage + chaseBonus + chBonus
         );
         this.animReactNonce++;
         this.changeState('HIT_STUN');
@@ -1107,7 +1423,7 @@ export class Fighter {
       blocked: false,
       counterHit: isCounter,
       damage: finalDamage,
-      hitstop: move.hitstop + (isCounter ? 3 : 0),
+      hitstop: move.hitstop + (isCounter ? 4 : 0),
       knockback: { x: kbX, y: kbY },
       isLauncher: !!move.isLauncher,
       isKnockdown: !!move.isHardKnockdown || this.health <= 0
@@ -1131,6 +1447,12 @@ export class Fighter {
     this.armorHitsLeft = 0;
     this.hadAirAttack = false;
     this.comboHitCount = 0;
+    this.comboDamageTotal = 0;
+    this.lastCounterHit = false;
+    this.throwBreakTimer = 0;
+    this.pendingThrowMove = null;
+    this.pendingThrowAttacker = null;
+    this.getUpOption = 0;
     this.juggleCount = 0;
     this.wallBounceCount = 0;
     this.wallBounceDamagePenalty = false;

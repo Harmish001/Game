@@ -1,8 +1,17 @@
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { CharacterVisualConfig, getCharacterVisual } from '../characters/visuals';
 import { CharacterProfile, FighterState } from './types';
+
+/** One network decode per URL — both fighters share, then SkeletonUtils.clone */
+const modelCache = new Map<
+  string,
+  Promise<{ root: THREE.Object3D; animations: THREE.AnimationClip[] }>
+>();
+/** Shared download progress 0–1 per model URL */
+const modelLoadProgress = new Map<string, number>();
 
 /**
  * FighterMesh — procedural humanoid OR loaded GLB/FBX (see characters/visuals.ts).
@@ -42,6 +51,10 @@ export class FighterMesh {
   private modelPivot: THREE.Group = new THREE.Group();
   private modelMaterials: THREE.MeshStandardMaterial[] = [];
   private modelReady: boolean = false;
+  private modelLoadFailed: boolean = false;
+  /** 0–1 while GLB downloads; 1 when ready or failed */
+  public loadProgress: number = 0;
+  public onLoadComplete: (() => void) | null = null;
   private mixer: THREE.AnimationMixer | null = null;
   private clipActions: Map<string, THREE.AnimationAction> = new Map();
   private activeClipName: string = '';
@@ -111,20 +124,26 @@ export class FighterMesh {
   }
 
   private buildShadowOnly(): void {
+    // Cast/receive real lights only — no floor blob disc
     this.root.castShadow = true;
     this.root.receiveShadow = true;
+    this.shadowBlob = null;
+  }
 
-    const shadowGeo = new THREE.CircleGeometry(0.42, 16);
-    shadowGeo.rotateX(-Math.PI / 2);
-    const shadowMat = new THREE.MeshBasicMaterial({
-      color: 0x030712,
-      transparent: true,
-      opacity: 0.55,
-      depthWrite: false
-    });
-    this.shadowBlob = new THREE.Mesh(shadowGeo, shadowMat);
-    this.shadowBlob.position.set(0, 0.012, 0);
-    this.root.add(this.shadowBlob);
+  public isModelReady(): boolean {
+    return this.modelReady;
+  }
+
+  public didModelFail(): boolean {
+    return this.modelLoadFailed;
+  }
+
+  private finishLoad(ok: boolean): void {
+    this.modelReady = true;
+    this.modelLoadFailed = !ok;
+    this.loadProgress = 1;
+    this.onLoadComplete?.();
+    this.onLoadComplete = null;
   }
 
   private loadCharacterModel(url: string): void {
@@ -134,37 +153,127 @@ export class FighterMesh {
       loader.load(
         url,
         (fbx) => this.onModelLoaded(fbx, fbx.animations || []),
-        undefined,
-        (err) => console.error('[FighterMesh] FBX load failed', url, err)
+        (e) => {
+          if (e.total > 0) this.loadProgress = Math.min(0.95, e.loaded / e.total);
+        },
+        (err) => {
+          console.error('[FighterMesh] FBX load failed', url, err);
+          this.finishLoad(false);
+        }
       );
       return;
     }
 
-    const loader = new GLTFLoader();
-    loader.load(
-      url,
-      (gltf) => this.onModelLoaded(gltf.scene, gltf.animations || []),
-      undefined,
-      (err) => console.error('[FighterMesh] GLB load failed', url, err)
-    );
+    let pending = modelCache.get(url);
+    if (!pending) {
+      modelLoadProgress.set(url, 0.02);
+      pending = new Promise((resolve, reject) => {
+        const loader = new GLTFLoader();
+        loader.load(
+          url,
+          (gltf) => {
+            modelLoadProgress.set(url, 0.92);
+            resolve({
+              root: gltf.scene,
+              animations: gltf.animations || []
+            });
+          },
+          (e) => {
+            if (e.total > 0) {
+              modelLoadProgress.set(url, Math.min(0.9, e.loaded / e.total));
+            } else {
+              const cur = modelLoadProgress.get(url) ?? 0.05;
+              modelLoadProgress.set(url, Math.min(0.7, cur + 0.03));
+            }
+          },
+          reject
+        );
+      });
+      modelCache.set(url, pending);
+    } else if ((modelLoadProgress.get(url) ?? 0) >= 0.92) {
+      // Already decoded — clone phase only
+      this.loadProgress = 0.9;
+    }
+
+    const progressTimer = window.setInterval(() => {
+      if (this.modelReady) {
+        window.clearInterval(progressTimer);
+        return;
+      }
+      const shared = modelLoadProgress.get(url) ?? 0.05;
+      this.loadProgress = Math.max(this.loadProgress, shared);
+    }, 50);
+
+    pending
+      .then(({ root, animations }) => {
+        window.clearInterval(progressTimer);
+        this.loadProgress = 0.95;
+        const instance = cloneSkinned(root) as THREE.Object3D;
+        const clips = animations.map((c) => c.clone());
+        this.onModelLoaded(instance, clips);
+      })
+      .catch((err) => {
+        window.clearInterval(progressTimer);
+        console.error('[FighterMesh] GLB load failed', url, err);
+        this.finishLoad(false);
+      });
   }
 
   private onModelLoaded(model: THREE.Object3D, animations: THREE.AnimationClip[]): void {
     model.traverse((obj) => {
       const n = obj.name;
-      if (n === 'Hips' || n === 'hips' || n === 'mixamorigHips') this.hipsBone = obj;
-      if (n === 'LeftHand' || n === 'mixamorigLeftHand') this.leftHandBone = obj;
-      if (n === 'RightHand' || n === 'mixamorigRightHand') this.rightHandBone = obj;
-      if (n === 'LeftToeBase' || n === 'mixamorigLeftToeBase') {
+      const nl = n.toLowerCase();
+      // Mixamo (Hips) + UE/retarget (pelvis) — same role
+      if (
+        nl === 'hips' ||
+        nl === 'pelvis' ||
+        nl === 'mixamorighips' ||
+        nl === 'hip'
+      ) {
+        this.hipsBone = obj;
+      }
+      if (
+        nl === 'lefthand' ||
+        nl === 'mixamoriglefthand' ||
+        nl === 'hand_l' ||
+        nl === 'handl'
+      ) {
+        this.leftHandBone = obj;
+      }
+      if (
+        nl === 'righthand' ||
+        nl === 'mixamorigrighthand' ||
+        nl === 'hand_r' ||
+        nl === 'handr'
+      ) {
+        this.rightHandBone = obj;
+      }
+      if (
+        nl === 'lefttoebase' ||
+        nl === 'mixamoriglefttoebase' ||
+        nl === 'ball_l' ||
+        nl === 'balll'
+      ) {
         this.leftToeBone = obj;
         this.leftFootBone = obj;
-      } else if (!this.leftFootBone && (n === 'LeftFoot' || n === 'mixamorigLeftFoot')) {
+      } else if (
+        !this.leftFootBone &&
+        (nl === 'leftfoot' || nl === 'mixamorigleftfoot' || nl === 'foot_l' || nl === 'footl')
+      ) {
         this.leftFootBone = obj;
       }
-      if (n === 'RightToeBase' || n === 'mixamorigRightToeBase') {
+      if (
+        nl === 'righttoebase' ||
+        nl === 'mixamorigrighttoebase' ||
+        nl === 'ball_r' ||
+        nl === 'ballr'
+      ) {
         this.rightToeBone = obj;
         this.rightFootBone = obj;
-      } else if (!this.rightFootBone && (n === 'RightFoot' || n === 'mixamorigRightFoot')) {
+      } else if (
+        !this.rightFootBone &&
+        (nl === 'rightfoot' || nl === 'mixamorigrightfoot' || nl === 'foot_r' || nl === 'footr')
+      ) {
         this.rightFootBone = obj;
       }
 
@@ -206,8 +315,8 @@ export class FighterMesh {
         action.enabled = true;
         this.clipActions.set(clip.name, action);
       }
-      const introName = this.visual?.introClip ?? 'Bow_RT';
-      const idleName = this.visual?.clips.idle ?? 'Fighting_Idle_RT';
+      const introName = this.visual?.introClip ?? 'Meditate';
+      const idleName = this.visual?.clips.idle ?? 'Fighting_Idle';
       this.mixer.addEventListener('finished', (e) => {
         const action = (e as { action?: THREE.AnimationAction }).action;
         if (this.introPlaying && action === this.clipActions.get(introName)) {
@@ -222,20 +331,23 @@ export class FighterMesh {
       console.warn('[FighterMesh] Model has no usable animation clips — static / lean only');
     }
 
-    this.modelReady = true;
     // Snap once after first pose so bow doesn't flash off-shadow
     this.alignModelToRoot();
+    this.finishLoad(true);
   }
 
   /**
-   * Lock Hips XZ to each clip's FIRST keyframe (not 0).
-   * Rest pose hips sit at Z≈89; Bow keys are Z≈-1 — zeroing caused the huge shadow gap.
+   * Lock pelvis/hips/root XZ to each clip's FIRST keyframe (not 0).
+   * Game moves fighter.root — clip must not walk-off in XZ.
+   * Matches Mixamo `Hips` and UE `pelvis` / `root`.
    */
   private stripHipRootMotion(clip: THREE.AnimationClip): THREE.AnimationClip {
     const cloned = clip.clone();
     for (const track of cloned.tracks) {
-      if (!/\.position$/.test(track.name)) continue;
-      if (!/hips/i.test(track.name)) continue;
+      if (!/\.(position|translation)$/i.test(track.name)) continue;
+      // bone name before .position — hips / pelvis / root only
+      const bone = track.name.split('.')[0] ?? '';
+      if (!/^(hips|pelvis|root|mixamorigHips)$/i.test(bone)) continue;
       const values = track.values;
       if (values.length < 3) continue;
       const lockX = values[0];
@@ -259,7 +371,7 @@ export class FighterMesh {
     this.hipsBone.getWorldPosition(this._alignHips);
     this.root.worldToLocal(this._alignLocal.copy(this._alignHips));
 
-    // Pull hips XZ onto root origin (where shadow blob lives)
+    // Pull hips/pelvis XZ onto fighter.root origin
     this.alignPivot.position.x -= this._alignLocal.x;
     this.alignPivot.position.z -= this._alignLocal.z;
 
@@ -383,10 +495,12 @@ export class FighterMesh {
     return [this.leftHandBone, this.rightHandBone];
   }
 
-  /** Round start intro from visuals.introClip (bow). */
+  /** Round start intro — trademark first, then introClip. */
   public playIntro(): void {
-    const intro = this.visual?.introClip;
-    if (!this.hasSkinnedAnims || !intro || !this.clipActions.has(intro)) return;
+    const intro =
+      this.visual?.trademarkClip ?? this.visual?.introClip;
+    if (!this.hasSkinnedAnims || !intro) return;
+    if (!this.resolveClipName(intro)) return;
     this.introPlaying = true;
     this.lastAttackClipKey = '';
     this.playClip(intro, false, true);
@@ -432,7 +546,8 @@ export class FighterMesh {
 
   private pickClipForState(
     state: FighterState,
-    activeMoveId: string
+    activeMoveId: string,
+    guarding: boolean = false
   ): { name: string; loop: boolean } | null {
     if (this.clipActions.size === 0) return null;
     const c = this.visual?.clips;
@@ -440,18 +555,20 @@ export class FighterMesh {
 
     switch (state) {
       case 'IDLE':
-        return { name: c.idle, loop: true };
+        // Hold block/back → Defend guard pose
+        return { name: guarding ? c.block : c.idle, loop: true };
       case 'WALK_FWD':
         return { name: c.walkFwd, loop: true };
       case 'DASH_FWD':
         return { name: c.dashFwd ?? c.walkFwd, loop: true };
       case 'WALK_BACK':
-        return { name: c.walkBack, loop: true };
+        // Walking back while guarding uses block stance (classic FG)
+        return { name: guarding ? c.block : c.walkBack, loop: true };
       case 'DASH_BACK':
         return { name: c.dashBack ?? c.walkBack, loop: false };
       case 'CROUCH_START':
       case 'CROUCHING':
-        return { name: c.crouch, loop: true };
+        return { name: guarding ? c.block : c.crouch, loop: true };
       case 'JUMP_START':
         return { name: c.jumpStart ?? c.jumpAir ?? c.idle, loop: false };
       case 'JUMPING':
@@ -473,7 +590,7 @@ export class FighterMesh {
       case 'THROW_TECH':
         return { name: c.throw, loop: false };
       case 'SUPER_CINEMATIC':
-        return { name: c.special, loop: false };
+        return { name: c.super ?? c.special, loop: false };
       case 'WIN':
         return { name: c.win, loop: true };
       case 'LOSE':
@@ -488,19 +605,29 @@ export class FighterMesh {
   private pickAttackClip(moveId: string): string {
     const c = this.visual!.clips;
     const id = moveId.toLowerCase();
-    if (id.includes('special') || id.includes('super')) return c.special;
+    if (id.includes('super')) return c.super ?? c.special;
+    if (id.includes('special_1')) return c.special1 ?? c.special;
+    if (id.includes('special_2')) return c.special2 ?? c.special;
+    if (id.includes('special_3')) return c.special3 ?? c.special;
+    if (id.includes('special') || id.includes('approach')) return c.special;
     if (id.includes('throw')) return c.throw;
+    if (id.includes('overhead')) return c.hp;
+    if (id.includes('anti') || id.includes('_aa') || id.includes('hlaunch')) {
+      return c.hk;
+    }
+    if (id.includes('far_hp')) return c.hp;
     if (id.includes('c_hk') || id.includes('sweep') || id.includes('slide')) {
       return c.crouchHk ?? c.hk;
     }
-    if (id.includes('c_lp')) return c.crouchLp ?? c.lp;
+    if (id.includes('c_lk')) return c.lk;
+    if (id.includes('c_hp') || id.includes('c_lp')) return c.crouchLp ?? c.lp;
+    if (id.includes('j_')) return c.airAttack ?? c.lp;
     if (id.includes('hk') || id.includes('launcher') || id.includes('roundhouse')) return c.hk;
     if (id.includes('lk') || id.includes('kick') || id.includes('stomp')) return c.lk;
     if (id.includes('hp') || id.includes('hook') || id.includes('haymaker') || id.includes('elbow')) {
       return c.hp;
     }
-    if (id.includes('j_')) return c.airAttack ?? c.lp;
-    if (id.includes('lp') || id.includes('jab')) return c.lp;
+    if (id.includes('lp') || id.includes('jab') || id.includes('lp2')) return c.lp;
     return c.lp;
   }
 
@@ -679,22 +806,17 @@ export class FighterMesh {
     fighterY: number = 0,
     moveDurationSec: number = 0,
     stateDurationSec: number = 0,
-    reactNonce: number = 0
+    reactNonce: number = 0,
+    guarding: boolean = false,
+    walkSpeedFwd: number = 3.4,
+    walkSpeedBack: number = 2.6,
+    dashSpeed: number = 6.8
   ): void {
     this.animTimer += dt;
     const t = this.animTimer;
 
     // Face the correct direction
     this.root.rotation.set(0, facingRight ? Math.PI / 2 : -Math.PI / 2, 0);
-
-    // Update Ground Shadow Blob
-    if (this.shadowBlob) {
-      const clampedY = Math.max(0, fighterY);
-      const scale = Math.max(0.35, 1.0 - clampedY * 0.16);
-      this.shadowBlob.scale.set(scale, scale, scale);
-      this.shadowBlob.position.set(0, -clampedY + 0.012, 0);
-      (this.shadowBlob.material as THREE.MeshBasicMaterial).opacity = Math.max(0.12, 0.55 - clampedY * 0.12);
-    }
 
     if (this.useModel) {
       this.updateModelAnimation(
@@ -706,7 +828,11 @@ export class FighterMesh {
         dt,
         moveDurationSec,
         stateDurationSec,
-        reactNonce
+        reactNonce,
+        guarding,
+        walkSpeedFwd,
+        walkSpeedBack,
+        dashSpeed
       );
       return;
     }
@@ -1032,7 +1158,11 @@ export class FighterMesh {
     dt: number,
     moveDurationSec: number = 0,
     stateDurationSec: number = 0,
-    reactNonce: number = 0
+    reactNonce: number = 0,
+    guarding: boolean = false,
+    walkSpeedFwd: number = 3.4,
+    walkSpeedBack: number = 2.6,
+    dashSpeed: number = 6.8
   ): void {
     if (!this.modelReady) return;
 
@@ -1044,7 +1174,6 @@ export class FighterMesh {
         this.isKickMove(moveId) ? kickSpeed : punchSpeed;
       const prone = state === 'KNOCKDOWN' || state === 'LOSE';
 
-      // Intro bow locks out other clips until finished (or fight input starts mid-bow)
       if (this.introPlaying) {
         if (state !== 'IDLE' && state !== 'WIN' && state !== 'LOSE') {
           this.introPlaying = false;
@@ -1055,7 +1184,7 @@ export class FighterMesh {
         }
       }
 
-      // Finish punch/kick at natural speed even after move → IDLE
+      // Hold attack clip only while standing idle recovery — never block locomotion
       if (this.holdingAttackClip && state !== 'ATTACK') {
         const interrupt =
           state === 'HIT_STUN' ||
@@ -1065,15 +1194,21 @@ export class FighterMesh {
           state === 'LOSE' ||
           state === 'JUMP_START' ||
           state === 'JUMPING' ||
+          state === 'JUMP_LAND' ||
           state === 'DASH_FWD' ||
-          state === 'DASH_BACK';
+          state === 'DASH_BACK' ||
+          state === 'WALK_FWD' ||
+          state === 'WALK_BACK' ||
+          state === 'CROUCH_START' ||
+          state === 'CROUCHING' ||
+          state === 'GET_UP';
         const held = this.clipActions.get(this.heldAttackClipName);
         const stillGoing =
           !!held &&
           held.isRunning() &&
           held.time < held.getClip().duration - 0.03;
 
-        if (!interrupt && stillGoing) {
+        if (!interrupt && stillGoing && state === 'IDLE') {
           held!.timeScale = this.heldAttackWasKick ? kickSpeed : punchSpeed;
           this.mixer.update(dt);
           this.alignModelToRoot(false);
@@ -1084,7 +1219,7 @@ export class FighterMesh {
         this.heldAttackWasKick = false;
       }
 
-      const pick = this.pickClipForState(state, activeMoveId);
+      const pick = this.pickClipForState(state, activeMoveId, guarding);
       if (pick) {
         let restart = false;
         if (state === 'ATTACK') {
@@ -1107,6 +1242,14 @@ export class FighterMesh {
           this.lastAttackClipKey = '';
           this.holdingAttackClip = false;
           this.heldAttackWasKick = false;
+          // Kill attack clip weight so Hit_Knockback isn't buried under jab
+          if (restart) {
+            for (const [name, act] of this.clipActions) {
+              if (name !== pick.name && act.isRunning()) {
+                act.fadeOut(0.06);
+              }
+            }
+          }
         } else {
           this.lastAttackClipKey = '';
           this.lastReactKey = '';
@@ -1122,7 +1265,14 @@ export class FighterMesh {
         if (action) {
           const clipDur = Math.max(0.05, action.getClip().duration);
           if (state === 'ATTACK') {
-            action.timeScale = attackSpeedFor(activeMoveId);
+            // Fit clip to move frame data so jab/kick match startup+active+recovery
+            if (moveDurationSec > 0.08) {
+              const fit = clipDur / moveDurationSec;
+              action.timeScale =
+                Math.min(1.85, Math.max(0.7, fit)) * (this.isKickMove(activeMoveId) ? 1.05 : 1.0);
+            } else {
+              action.timeScale = attackSpeedFor(activeMoveId);
+            }
           } else if (
             state === 'HIT_STUN' ||
             state === 'BLOCK_STUN' ||
@@ -1130,14 +1280,21 @@ export class FighterMesh {
           ) {
             if (stateDurationSec > 0.05) {
               const fit = clipDur / stateDurationSec;
-              action.timeScale = Math.min(1.15, Math.max(0.7, fit)) * reactSpeed;
+              action.timeScale = Math.min(1.25, Math.max(0.75, fit)) * reactSpeed;
             } else {
               action.timeScale = reactSpeed;
             }
-          } else if (state === 'WALK_FWD' || state === 'DASH_FWD') {
-            action.timeScale = 1.05;
+          } else if (state === 'WALK_FWD') {
+            // Sync foot cycle to walk speed (~3.0 = natural Walk clip pace)
+            action.timeScale = Math.min(1.55, Math.max(0.75, walkSpeedFwd / 3.0));
           } else if (state === 'WALK_BACK') {
-            action.timeScale = 0.9;
+            action.timeScale = Math.min(1.35, Math.max(0.7, walkSpeedBack / 2.8));
+          } else if (state === 'DASH_FWD') {
+            action.timeScale = Math.min(1.9, Math.max(1.15, dashSpeed / 5.5));
+          } else if (state === 'DASH_BACK') {
+            action.timeScale = 1.35;
+          } else if (state === 'JUMP_START' || state === 'JUMP_LAND') {
+            action.timeScale = 1.35;
           } else {
             action.timeScale = 1.0;
           }

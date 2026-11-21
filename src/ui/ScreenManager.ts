@@ -24,6 +24,106 @@ export class ScreenManager {
   public onQuitToMenu?: () => void;
   public onPreviewFighter?: (fighterId: FighterId) => void;
 
+  /** Match asset loader overlay (blocks blank fight canvas) */
+  public showMatchLoader(p1Name: string, p2Name: string): void {
+    this.container.innerHTML = `
+      ${this.sharedStyles}
+      <style>
+        .match-loader {
+          position: absolute;
+          inset: 0;
+          z-index: 50;
+          pointer-events: auto;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 18px;
+          background:
+            radial-gradient(ellipse at 50% 40%, rgba(30,58,138,0.35) 0%, transparent 55%),
+            linear-gradient(180deg, #06090f 0%, #0c1220 100%);
+        }
+        .match-loader-vs {
+          font-family: 'Teko', sans-serif;
+          font-size: clamp(1.8rem, 5vw, 3rem);
+          letter-spacing: 4px;
+          text-transform: uppercase;
+          color: #e2e8f0;
+        }
+        .match-loader-vs span.gold { color: var(--gold); }
+        .match-loader-bar {
+          width: min(420px, 72vw);
+          height: 10px;
+          border-radius: 6px;
+          background: #0f172a;
+          border: 1px solid #1e3a5f;
+          overflow: hidden;
+          box-shadow: inset 0 2px 6px rgba(0,0,0,0.6);
+        }
+        .match-loader-fill {
+          height: 100%;
+          width: 0%;
+          background: linear-gradient(90deg, #1d4ed8, #fbbf24, #fef08a);
+          background-size: 200% 100%;
+          animation: loaderShine 1.2s linear infinite;
+          transition: width 0.15s ease-out;
+        }
+        @keyframes loaderShine {
+          0% { background-position: 100% 0; }
+          100% { background-position: -100% 0; }
+        }
+        .match-loader-pct {
+          font-family: 'Rajdhani', sans-serif;
+          font-size: 1.35rem;
+          font-weight: 700;
+          color: #94a3b8;
+          letter-spacing: 2px;
+        }
+        .match-loader-hint {
+          font-size: 0.95rem;
+          color: #64748b;
+          letter-spacing: 1px;
+        }
+        .match-loader-spin {
+          width: 42px;
+          height: 42px;
+          border: 3px solid #1e3a5f;
+          border-top-color: var(--gold);
+          border-radius: 50%;
+          animation: spinLoader 0.7s linear infinite;
+        }
+        @keyframes spinLoader {
+          to { transform: rotate(360deg); }
+        }
+      </style>
+      <div class="match-loader interactive" id="match-loader">
+        <div class="match-loader-spin" aria-hidden="true"></div>
+        <div class="match-loader-vs">
+          ${p1Name} <span class="gold">VS</span> ${p2Name}
+        </div>
+        <div class="match-loader-bar">
+          <div class="match-loader-fill" id="match-loader-fill"></div>
+        </div>
+        <div class="match-loader-pct" id="match-loader-pct">LOADING 0%</div>
+        <div class="match-loader-hint">Preparing fighters…</div>
+      </div>
+    `;
+  }
+
+  public updateMatchLoader(progress01: number, hint?: string): void {
+    const pct = Math.max(0, Math.min(100, Math.round(progress01 * 100)));
+    const fill = this.container.querySelector('#match-loader-fill') as HTMLElement | null;
+    const label = this.container.querySelector('#match-loader-pct');
+    const hintEl = this.container.querySelector('.match-loader-hint');
+    if (fill) fill.style.width = `${pct}%`;
+    if (label) label.textContent = `LOADING ${pct}%`;
+    if (hint && hintEl) hintEl.textContent = hint;
+  }
+
+  public hideMatchLoader(): void {
+    this.container.innerHTML = '';
+  }
+
   constructor(container: HTMLElement, audio: AudioManager) {
     this.container = container;
     this.audio = audio;
